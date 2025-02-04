@@ -397,7 +397,7 @@ where
                 Ok(value)
             }
             Err(err) => {
-                tracing::debug!("Transaction being rolled back");
+                tracing::debug!("Transaction being rolled back err={}", err);
                 match conn.raw_query_write(|conn| {
                     <Db as XmtpDb>::TransactionManager::rollback_transaction(&mut *conn)
                 }) {

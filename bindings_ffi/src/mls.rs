@@ -2502,7 +2502,7 @@ mod tests {
         let nonce = 1;
         let inbox_id = generate_inbox_id(&ffi_inbox_owner.get_address(), &nonce).unwrap();
         let client = create_client(
-            connect_to_backend(xmtp_api_grpc::LOCALHOST_ADDRESS.to_string(), false)
+            connect_to_backend(xmtp_api_grpc::DEV_ADDRESS.to_string(), true)
                 .await
                 .unwrap(),
             Some(tmp_path()),
