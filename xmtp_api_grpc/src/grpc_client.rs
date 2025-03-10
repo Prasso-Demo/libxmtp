@@ -205,17 +205,16 @@ mod test {
     use super::*;
     use xmtp_proto::api_client::XmtpTestClient;
 
-    #[async_trait::async_trait]
     impl XmtpTestClient for GrpcClient {
         type Builder = ClientBuilder;
-        async fn create_local() -> Self::Builder {
+        fn create_local() -> Self::Builder {
             let mut client = GrpcClient::builder();
             client.set_host("http://localhost:5556".into());
             client.set_tls(false);
             client
         }
 
-        async fn create_dev() -> Self::Builder {
+        fn create_dev() -> Self::Builder {
             let mut client = GrpcClient::builder();
             client.set_host("https://grpc.dev.xmtp.network:443".into());
             client.set_tls(true);

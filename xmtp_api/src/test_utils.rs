@@ -90,9 +90,30 @@ pub use wasm::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod not_wasm {
     use super::*;
+    use xmtp_proto::api_client::ApiBuilder;
     use xmtp_proto::xmtp::mls::api::v1::WelcomeMessage;
     #[derive(Clone)]
     pub struct ApiClient;
+    pub struct MockApiBuilder;
+
+    impl ApiBuilder for MockApiBuilder {
+        type Output = ApiClient;
+        type Error = MockError;
+
+        fn set_libxmtp_version(&mut self, version: String) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_app_version(&mut self, version: String) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_host(&mut self, host: String) {
+        }
+        fn set_payer(&mut self, _host: String) {}
+        fn set_tls(&mut self, tls: bool) {}
+        async fn build(self) -> Result<Self::Output, Self::Error> {
+            Ok(ApiClient)
+        }
+    }
 
     mock! {
         pub ApiClient { }
@@ -142,11 +163,10 @@ mod not_wasm {
             -> Result<VerifySmartContractWalletSignaturesResponse, MockError>;
         }
 
-        #[async_trait::async_trait]
         impl XmtpTestClient for ApiClient {
-            type Builder = ApiClient;
-            async fn create_local() -> Self { ApiClient }
-            async fn create_dev() -> Self { ApiClient }
+            type Builder = MockApiBuilder;
+            fn create_local() -> MockApiBuilder { MockApiBuilder }
+            fn create_dev() -> MockApiBuilder { MockApiBuilder }
         }
     }
 }
@@ -208,9 +228,9 @@ mod wasm {
 
         #[async_trait::async_trait(?Send)]
         impl XmtpTestClient for ApiClient {
-            type Builder = ApiClient;
-            async fn create_local() -> Self { ApiClient }
-            async fn create_dev() -> Self { ApiClient }
+            type Builder = ();
+            fn create_local() -> () { () }
+            fn create_dev() -> () { () }
         }
     }
 }

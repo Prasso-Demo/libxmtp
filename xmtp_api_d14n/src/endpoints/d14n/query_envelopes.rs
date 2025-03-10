@@ -81,8 +81,12 @@ impl Endpoint for QueryEnvelopes {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod test {
+    use xmtp_proto::prelude::*;
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
     #[test]
     fn test_file_descriptor() {
         use xmtp_proto::xmtp::xmtpv4::message_api::{QueryEnvelopesRequest, FILE_DESCRIPTOR_SET};
@@ -90,21 +94,11 @@ mod test {
         println!("{}", pnq);
     }
 
-    #[cfg(feature = "grpc-api")]
-    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
-    #[cfg(not(target_arch = "wasm32"))]
+    #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn test_get_inbox_ids() {
         use crate::d14n::QueryEnvelopes;
-        use xmtp_api_grpc::grpc_client::GrpcClient;
-        use xmtp_api_grpc::LOCALHOST_ADDRESS;
-        use xmtp_proto::api_client::ApiBuilder;
-        use xmtp_proto::traits::Query;
-        use xmtp_proto::xmtp::xmtpv4::message_api::EnvelopesQuery;
 
-        let mut client = GrpcClient::builder();
-        client.set_app_version("0.0.0".into()).unwrap();
-        client.set_tls(false);
-        client.set_host(LOCALHOST_ADDRESS.to_string());
+        let client = crate::TestClient::create_local();
         let client = client.build().await.unwrap();
 
         let endpoint = QueryEnvelopes::builder()

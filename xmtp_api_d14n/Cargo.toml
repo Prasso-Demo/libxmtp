@@ -14,8 +14,13 @@ prost-types.workspace = true
 xmtp_common.workspace = true
 xmtp_proto = { workspace = true, features = ["convert"] }
 
+[dev-dependencies]
+xmtp_proto = { workspace = true, features = ["convert", "test-utils"] }
+xmtp_common = { workspace = true, features = ["test-utils"] }
+wasm-bindgen-test.workspace = true
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-xmtp_api_grpc.workspace = true
+xmtp_api_grpc = { workspace = true, features = ["test-utils"] }
 xmtp_api_http.workspace = true
 tokio.workspace = true
 
@@ -24,5 +29,7 @@ xmtp_api_http.workspace = true
 tokio.workspace = true
 
 [features]
+default = ["grpc-api"]
 http-api = ["xmtp_proto/http-api"]
 grpc-api = ["xmtp_proto/grpc-api"]
+test-utils = []

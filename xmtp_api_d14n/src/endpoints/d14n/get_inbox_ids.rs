@@ -48,10 +48,10 @@ impl Endpoint for GetInboxIds {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod test {
     use crate::d14n::GetInboxIds;
-    use xmtp_proto::traits::Query;
+    use xmtp_proto::prelude::*;
     use xmtp_proto::xmtp::xmtpv4::message_api::GetInboxIdsResponse;
 
     #[test]
@@ -61,41 +61,9 @@ mod test {
         println!("{}", pnq);
     }
 
-    #[cfg(feature = "grpc-api")]
     #[tokio::test]
     async fn test_get_inbox_ids() {
-        use crate::d14n::GetInboxIds;
-        use xmtp_api_grpc::grpc_client::GrpcClient;
-        use xmtp_api_grpc::LOCALHOST_ADDRESS;
-        use xmtp_proto::api_client::ApiBuilder;
-        use xmtp_proto::traits::Query;
-
-        let mut client = GrpcClient::builder();
-        client.set_app_version("0.0.0".into()).unwrap();
-        client.set_tls(false);
-        client.set_host(LOCALHOST_ADDRESS.to_string());
-        let client = client.build().await.unwrap();
-
-        let endpoint = GetInboxIds::builder()
-            .addresses(vec!["".to_string()])
-            .build()
-            .unwrap();
-
-        //todo: fix later when it was implemented
-        let result = endpoint.query(&client).await;
-        assert!(result.is_err());
-    }
-
-    #[cfg(feature = "http-api")]
-    #[tokio::test]
-    async fn test_get_inbox_ids_http() {
-        use xmtp_proto::api_client::ApiBuilder;
-
-        let mut client = XmtpHttpApiClient::builder();
-        client.set_app_version("0.0.0".into()).unwrap();
-        client.set_libxmtp_version("0.0.0".into()).unwrap();
-        client.set_tls(true);
-        client.set_host(LOCALHOST_ADDRESS.to_string());
+        let client = crate::TestClient::create_local();
         let client = client.build().await.unwrap();
 
         let endpoint = GetInboxIds::builder()
