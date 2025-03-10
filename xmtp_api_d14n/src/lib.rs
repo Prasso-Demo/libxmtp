@@ -7,10 +7,12 @@ pub(crate) use proto_cache::*;
 pub mod compat;
 
 #[cfg(any(test, feature = "test-utils"))]
-pub mod test {
+pub use tests::*;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod tests {
     #[cfg(feature = "grpc-api")]
-    type TestClient = xmtp_api_grpc::grpc_client::GrpcClient;
+    pub type TestClient = xmtp_api_grpc::grpc_client::GrpcClient;
 
     #[cfg(feature = "http-api")]
-    type TestClient = xmtp_api_http::XmtpHttpApiClient;
+    pub type TestClient = xmtp_api_http::XmtpHttpApiClient;
 }

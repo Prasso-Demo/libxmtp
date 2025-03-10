@@ -7439,6 +7439,7 @@ dependencies = [
  "prost",
  "prost-types",
  "tokio",
+ "wasm-bindgen-test",
  "xmtp_api_grpc",
  "xmtp_api_http",
  "xmtp_common",
