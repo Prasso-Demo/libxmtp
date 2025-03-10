@@ -144,6 +144,7 @@ mod not_wasm {
 
         #[async_trait::async_trait]
         impl XmtpTestClient for ApiClient {
+            type Builder = ApiClient;
             async fn create_local() -> Self { ApiClient }
             async fn create_dev() -> Self { ApiClient }
         }
@@ -207,6 +208,7 @@ mod wasm {
 
         #[async_trait::async_trait(?Send)]
         impl XmtpTestClient for ApiClient {
+            type Builder = ApiClient;
             async fn create_local() -> Self { ApiClient }
             async fn create_dev() -> Self { ApiClient }
         }
