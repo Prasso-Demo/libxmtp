@@ -48,29 +48,30 @@ where
     }
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[allow(clippy::unwrap_used)]
 impl xmtp_proto::api_client::XmtpTestClient for crate::XmtpHttpApiClient {
-    async fn create_local() -> Self {
+    type Builder = crate::XmtpHttpApiClientBuilder;
+    async fn create_local() -> Self::Builder {
         use xmtp_proto::api_client::ApiBuilder;
         let mut api = crate::XmtpHttpApiClient::builder();
         api.set_host(crate::constants::ApiUrls::LOCAL_ADDRESS.into());
         api.set_libxmtp_version(env!("CARGO_PKG_VERSION").into())
             .unwrap();
         api.set_app_version("0.0.0".into()).unwrap();
-        api.build().await.unwrap()
+        api
     }
 
-    async fn create_dev() -> Self {
+    async fn create_dev() -> Self::Builder {
         use xmtp_proto::api_client::ApiBuilder;
         let mut api = crate::XmtpHttpApiClient::builder();
         api.set_host(crate::constants::ApiUrls::DEV_ADDRESS.into());
         api.set_libxmtp_version(env!("CARGO_PKG_VERSION").into())
             .unwrap();
         api.set_app_version("0.0.0".into()).unwrap();
-        api.build().await.unwrap()
+        api
     }
 }
 
