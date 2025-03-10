@@ -89,8 +89,6 @@ mod test {
     #[cfg(feature = "http-api")]
     #[tokio::test]
     async fn test_get_inbox_ids_http() {
-        use xmtp_api_http::XmtpHttpApiClient;
-        use xmtp_api_http::LOCALHOST_ADDRESS;
         use xmtp_proto::api_client::ApiBuilder;
 
         let mut client = XmtpHttpApiClient::builder();
