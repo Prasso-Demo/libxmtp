@@ -231,6 +231,9 @@ mod wasm {
             type Builder = ();
             fn create_local() -> () { () }
             fn create_dev() -> () { () }
+            fn create_local_payer() -> () { () }
+            fn create_local_d14n() -> () { () }
+
         }
     }
 }

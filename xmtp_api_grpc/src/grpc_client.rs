@@ -214,6 +214,20 @@ mod test {
             client
         }
 
+        fn create_local_d14n() -> Self::Builder {
+            let mut client = GrpcClient::builder();
+            client.set_host("http://localhost:5050".into());
+            client.set_tls(false);
+            client
+        }
+
+        fn create_local_payer() -> Self::Builder {
+            let mut client = GrpcClient::builder();
+            client.set_host("http://localhost:5050".into());
+            client.set_tls(false);
+            client
+        }
+
         fn create_dev() -> Self::Builder {
             let mut client = GrpcClient::builder();
             client.set_host("https://grpc.dev.xmtp.network:443".into());

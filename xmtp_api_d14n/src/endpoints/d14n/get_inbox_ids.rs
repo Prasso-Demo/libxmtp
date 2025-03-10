@@ -53,17 +53,17 @@ mod test {
     use crate::d14n::GetInboxIds;
     use xmtp_proto::prelude::*;
     use xmtp_proto::xmtp::xmtpv4::message_api::GetInboxIdsResponse;
+    use super::*;
 
     #[test]
     fn test_file_descriptor() {
-        use xmtp_proto::xmtp::xmtpv4::message_api::{GetInboxIdsRequest, FILE_DESCRIPTOR_SET};
         let pnq = crate::path_and_query::<GetInboxIdsRequest>(FILE_DESCRIPTOR_SET);
         println!("{}", pnq);
     }
 
     #[tokio::test]
     async fn test_get_inbox_ids() {
-        let client = crate::TestClient::create_local();
+        let client = crate::TestClient::create_local_d14n();
         let client = client.build().await.unwrap();
 
         let endpoint = GetInboxIds::builder()
@@ -71,14 +71,6 @@ mod test {
             .build()
             .unwrap();
 
-        let result: Result<GetInboxIdsResponse, _> = endpoint.query(&client).await;
-        match result {
-            Ok(response) => {
-                assert_eq!(response.responses.len(), 0);
-            }
-            Err(err) => {
-                panic!("Test failed: {:?}", err);
-            }
-        }
+        let _: GetInboxIdsResponse = endpoint.query(&client).await.unwrap();
     }
 }

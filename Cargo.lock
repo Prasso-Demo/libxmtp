@@ -7433,12 +7433,14 @@ name = "xmtp_api_d14n"
 version = "1.0.0-rc1"
 dependencies = [
  "async-trait",
+ "ctor",
  "derive_builder",
  "once_cell",
  "parking_lot 0.12.3",
  "prost",
  "prost-types",
  "tokio",
+ "tracing",
  "wasm-bindgen-test",
  "xmtp_api_grpc",
  "xmtp_api_http",

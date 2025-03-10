@@ -52,6 +52,27 @@ where
 #[allow(clippy::unwrap_used)]
 impl xmtp_proto::api_client::XmtpTestClient for crate::XmtpHttpApiClient {
     type Builder = crate::XmtpHttpApiClientBuilder;
+    fn create_local_d14n() -> Self::Builder {
+        use xmtp_proto::api_client::ApiBuilder;
+        let mut api = crate::XmtpHttpApiClient::builder();
+        api.set_host(crate::constants::ApiUrls::LOCAL_D14N_ADDRESS.into());
+        api.set_libxmtp_version(env!("CARGO_PKG_VERSION").into())
+            .unwrap();
+        api.set_app_version("0.0.0".into()).unwrap();
+        api
+    }
+
+    fn create_local_payer() -> Self::Builder {
+        use xmtp_proto::api_client::ApiBuilder;
+        let mut api = crate::XmtpHttpApiClient::builder();
+        // payer has same address as d14n locally
+        api.set_host(crate::constants::ApiUrls::LOCAL_D14N_ADDRESS.into());
+        api.set_libxmtp_version(env!("CARGO_PKG_VERSION").into())
+            .unwrap();
+        api.set_app_version("0.0.0".into()).unwrap();
+        api
+    }
+
     fn create_local() -> Self::Builder {
         use xmtp_proto::api_client::ApiBuilder;
         let mut api = crate::XmtpHttpApiClient::builder();

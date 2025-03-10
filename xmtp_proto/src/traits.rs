@@ -71,7 +71,7 @@ where
     E: Endpoint<Output = T> + Sync,
     C: Client + Sync + Send,
     T: Default + prost::Message,
-    // TODO: figure out how to get conversions rightfigure out how to get conversions right
+    // TODO: figure out how to get conversions right
     // T: TryFrom<E::Output>,
     // ApiError<<C as Client>::Error>: From<<T as TryFrom<E::Output>>::Error>,
 {
