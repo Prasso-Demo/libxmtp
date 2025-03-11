@@ -50,10 +50,10 @@ impl Endpoint for GetInboxIds {
 
 #[cfg(test)]
 mod test {
+    use super::*;
     use crate::d14n::GetInboxIds;
     use xmtp_proto::prelude::*;
     use xmtp_proto::xmtp::xmtpv4::message_api::GetInboxIdsResponse;
-    use super::*;
 
     #[test]
     fn test_file_descriptor() {

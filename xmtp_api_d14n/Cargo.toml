@@ -16,14 +16,16 @@ tracing.workspace = true
 xmtp_common.workspace = true
 xmtp_proto = { workspace = true, features = ["convert"] }
 
+xmtp_api_http = { workspace = true, optional = true }
+
 [dev-dependencies]
 xmtp_proto = { workspace = true, features = ["convert", "test-utils"] }
 xmtp_common = { workspace = true, features = ["test-utils"] }
 wasm-bindgen-test.workspace = true
+hex.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 xmtp_api_grpc = { workspace = true, features = ["test-utils"] }
-xmtp_api_http.workspace = true
 tokio.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
@@ -32,6 +34,6 @@ tokio.workspace = true
 
 [features]
 default = ["grpc-api"]
-http-api = ["xmtp_proto/http-api"]
+http-api = ["xmtp_proto/http-api", "xmtp_api_http"]
 grpc-api = ["xmtp_proto/grpc-api"]
 test-utils = []

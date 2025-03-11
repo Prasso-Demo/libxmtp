@@ -31,11 +31,15 @@ impl Client for GrpcClient {
     type Error = crate::GrpcError;
     type Stream = tonic::Streaming<Bytes>;
 
-    async fn request(
+    async fn request<T>(
         &self,
         request: http::request::Builder,
         body: Vec<u8>,
-    ) -> Result<http::Response<Bytes>, ApiError<Self::Error>> {
+    ) -> Result<http::Response<T>, ApiError<Self::Error>>
+    where
+        Self: Sized,
+        T: Default + prost::Message + 'static,
+    {
         let client = &mut self.inner.clone();
         client
             .ready()
@@ -198,8 +202,6 @@ pub async fn create_tls_channel(address: String) -> Result<Channel, GrpcBuilderE
     Ok(channel)
 }
 
-
-
 #[cfg(any(test, feature = "test-utils"))]
 mod test {
     use super::*;
@@ -236,5 +238,3 @@ mod test {
         }
     }
 }
-
-

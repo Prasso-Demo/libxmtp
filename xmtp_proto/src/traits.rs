@@ -1,5 +1,6 @@
 //! Api Client Traits
 
+use http_body_util::BodyExt;
 use prost::bytes::Bytes;
 use std::borrow::Cow;
 use thiserror::Error;
@@ -26,17 +27,34 @@ where
 }
 */
 
+#[derive(thiserror::Error, Debug)]
+enum MockE {}
+use futures::Future;
+pub type BoxedClient = Box<
+    dyn Client<
+        Error = ApiError<MockE>,
+        Stream = futures::stream::Once<Box<dyn Future<Output = ()>>>,
+    >,
+>;
+
+fn try_to_call(c: BoxedClient) {
+    // c.request(Default::default(), vec![]).unwrap()
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait Client {
     type Error: std::error::Error + Send + Sync + 'static;
     type Stream: futures::Stream;
 
-    async fn request(
+    async fn request<T>(
         &self,
         request: http::request::Builder,
         body: Vec<u8>,
-    ) -> Result<http::Response<Bytes>, ApiError<Self::Error>>;
+    ) -> Result<http::Response<T>, ApiError<Self::Error>>
+    where
+        T: Default + prost::Message + 'static,
+        Self: Sized;
 
     async fn stream(
         &self,
@@ -70,7 +88,7 @@ impl<E, T, C> Query<T, C> for E
 where
     E: Endpoint<Output = T> + Sync,
     C: Client + Sync + Send,
-    T: Default + prost::Message,
+    T: Default + prost::Message + 'static,
     // TODO: figure out how to get conversions right
     // T: TryFrom<E::Output>,
     // ApiError<<C as Client>::Error>: From<<T as TryFrom<E::Output>>::Error>,
@@ -85,9 +103,28 @@ where
             self.grpc_endpoint()
         };
         let request = request.uri(endpoint.as_ref());
-        let rsp = client.request(request, self.body()?).await?;
-        let rsp: E::Output = prost::Message::decode(rsp.into_body())?;
-        Ok(rsp)
+        /*let rsp: http::Response<
+            http_body_util::combinators::UnsyncBoxBody<prost::bytes::Bytes, ApiError<C::Error>>,
+        > = client.request(request, self.body()?).await?;*/
+        let rsp = client.request::<T>(request, self.body()?).await?;
+        Ok(rsp.into_body())
+        // let b = http_body_util::BodyStream::new(rsp.into_body());
+        // let bytes = BodyExt::collect(b).await.map(|b| b.to_bytes())?;
+
+        /*
+                let bytes = BodyExt::collect(rsp.into_body())
+                    .await
+                    .map(|b| b.to_bytes());
+        */
+        // let body = rsp.into_body();
+        // println!("body: {}", hex::encode(&body));
+
+        // Ok(prost::Message::decode(bytes)?)
+        // Ok(prost::Message::decode(rsp.into_body())?)
+        // let mut final_rsp: E::Output = Default::default();
+        // final_rsp.merge(rsp.into_body()).map(Option::Some)?;
+        // println!("{:?}", final_rsp);
+        // Ok(final_rsp)
     }
 }
 
@@ -167,3 +204,61 @@ impl RetryableError for BodyError {
         false
     }
 }
+/*
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock {
+    use super::*;
+
+    pub struct MockClient;
+    pub struct MockStream;
+
+    #[derive(thiserror::Error, Debug)]
+    pub enum MockError {}
+
+    type Repeat = Box<dyn (FnMut() -> prost::bytes::Bytes)>;
+    type MockStreamT = futures::stream::RepeatWith<Repeat>;
+    #[cfg(not(target_arch = "wasm32"))]
+    mockall::mock! {
+        pub MockClient {}
+
+        #[async_trait::async_trait]
+        impl Client for MockClient {
+            type Error = MockError;
+            type Stream = MockStreamT;
+            async fn request<T>(
+                &self,
+                request: http::request::Builder,
+                body: Vec<u8>,
+            ) -> Result<http::Response<T>, ApiError<MockError>> where Self: Sized;
+
+            async fn stream(
+                &self,
+                request: http::request::Builder,
+                body: Vec<u8>,
+            ) -> Result<http::Response<MockStreamT>, ApiError<MockError>>;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    mockall::mock! {
+        pub MockClient {}
+
+        #[async_trait::async_trait(?Send)]
+        impl Client for MockClient {
+            type Error = MockError;
+            type Stream = MockStreamT;
+            async fn request(
+                &self,
+                request: http::request::Builder,
+                body: Vec<u8>,
+            ) -> Result<http::Response<Bytes>, ApiError<MockError>>;
+
+            async fn stream(
+                &self,
+                request: http::request::Builder,
+                body: Vec<u8>,
+            ) -> Result<http::Response<MockStreamT>, ApiError<MockError>>;
+        }
+    }
+}
+*/
