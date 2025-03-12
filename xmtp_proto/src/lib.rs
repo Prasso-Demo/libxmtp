@@ -11,6 +11,9 @@ pub use error::*;
 pub mod api_client;
 pub mod traits;
 
+#[macro_use]
+extern crate tracing;
+
 #[cfg(feature = "convert")]
 pub mod convert;
 #[cfg(feature = "convert")]

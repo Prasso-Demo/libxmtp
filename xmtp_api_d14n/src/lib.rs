@@ -17,12 +17,13 @@ pub mod tests {
     #[cfg(feature = "grpc-api")]
     pub type TestClient = xmtp_api_grpc::grpc_client::GrpcClient;
 
-    #[cfg(feature = "http-api")]
+    #[cfg(all(feature = "http-api", not(feature = "grpc-api")))]
     pub type TestClient = xmtp_api_http::XmtpHttpApiClient;
 
     // Execute once before any tests are run
     #[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
     #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(test)]
     fn _setup() {
         xmtp_common::logger();
     }

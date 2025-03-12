@@ -32,6 +32,9 @@ use xmtp_proto::{
     ApiEndpoint,
 };
 
+#[macro_use]
+extern crate tracing;
+
 use crate::constants::ApiEndpoints;
 pub use crate::error::{Error, ErrorResponse, HttpClientError};
 pub const LOCALHOST_ADDRESS: &str = "http://localhost:5555";
@@ -49,7 +52,7 @@ fn reqwest_builder() -> reqwest::ClientBuilder {
 #[derive(Clone)]
 pub struct XmtpHttpApiClient {
     http_client: reqwest::Client,
-    host_url: String,
+    host_url: http::uri::Uri,
     app_version: String,
     libxmtp_version: String,
 }
@@ -64,7 +67,7 @@ impl XmtpHttpApiClient {
 
         Ok(XmtpHttpApiClient {
             http_client: client,
-            host_url,
+            host_url: http::uri::Uri::try_from(host_url)?,
             app_version,
             libxmtp_version,
         })
@@ -75,7 +78,7 @@ impl XmtpHttpApiClient {
     }
 
     fn endpoint(&self, endpoint: &str) -> String {
-        format!("{}{}", self.host_url, endpoint)
+        format!("{}{}", self.host_url.to_string(), endpoint)
     }
 
     pub fn app_version(&self) -> &str {
@@ -117,6 +120,10 @@ pub enum HttpClientBuilderError {
     ReqwestErrror(#[from] reqwest::Error),
     #[error(transparent)]
     InvalidHeaderValue(#[from] reqwest::header::InvalidHeaderValue),
+    #[error(transparent)]
+    InvalidUri(#[from] http::uri::InvalidUri),
+    #[error(transparent)]
+    InvalidUriParts(#[from] http::uri::InvalidUriParts),
 }
 
 impl ApiBuilder for XmtpHttpApiClientBuilder {
@@ -154,7 +161,7 @@ impl ApiBuilder for XmtpHttpApiClientBuilder {
             .ok_or(HttpClientBuilderError::MissingAppVersion)?;
         Ok(XmtpHttpApiClient {
             http_client,
-            host_url: self.host_url,
+            host_url: http::uri::Uri::try_from(self.host_url)?,
             app_version,
             libxmtp_version,
         })

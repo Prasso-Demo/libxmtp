@@ -1,7 +1,5 @@
 //! Api Client Traits
 
-use http_body_util::BodyExt;
-use prost::bytes::Bytes;
 use std::borrow::Cow;
 use thiserror::Error;
 use xmtp_common::{retry_async, retryable, BoxedRetry, RetryableError};
@@ -27,26 +25,14 @@ where
 }
 */
 
-#[derive(thiserror::Error, Debug)]
-enum MockE {}
-use futures::Future;
-pub type BoxedClient = Box<
-    dyn Client<
-        Error = ApiError<MockE>,
-        Stream = futures::stream::Once<Box<dyn Future<Output = ()>>>,
-    >,
->;
-
-fn try_to_call(c: BoxedClient) {
-    // c.request(Default::default(), vec![]).unwrap()
-}
-
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait Client {
     type Error: std::error::Error + Send + Sync + 'static;
     type Stream: futures::Stream;
 
+    // TODO: this T can be removed if we figure out how to drop unknown fields from proto messages
+    // there must be a good way to do this with prost
     async fn request<T>(
         &self,
         request: http::request::Builder,
@@ -103,28 +89,8 @@ where
             self.grpc_endpoint()
         };
         let request = request.uri(endpoint.as_ref());
-        /*let rsp: http::Response<
-            http_body_util::combinators::UnsyncBoxBody<prost::bytes::Bytes, ApiError<C::Error>>,
-        > = client.request(request, self.body()?).await?;*/
         let rsp = client.request::<T>(request, self.body()?).await?;
         Ok(rsp.into_body())
-        // let b = http_body_util::BodyStream::new(rsp.into_body());
-        // let bytes = BodyExt::collect(b).await.map(|b| b.to_bytes())?;
-
-        /*
-                let bytes = BodyExt::collect(rsp.into_body())
-                    .await
-                    .map(|b| b.to_bytes());
-        */
-        // let body = rsp.into_body();
-        // println!("body: {}", hex::encode(&body));
-
-        // Ok(prost::Message::decode(bytes)?)
-        // Ok(prost::Message::decode(rsp.into_body())?)
-        // let mut final_rsp: E::Output = Default::default();
-        // final_rsp.merge(rsp.into_body()).map(Option::Some)?;
-        // println!("{:?}", final_rsp);
-        // Ok(final_rsp)
     }
 }
 

@@ -23,7 +23,6 @@ where
 {
     if response.status().is_success() {
         let res = response.bytes().await.map_err(HttpClientError::from)?;
-        tracing::info!("Bytes: {}", hex::encode(&res));
         return Ok(Message::decode(res).map_err(HttpClientError::from)?);
     }
 
