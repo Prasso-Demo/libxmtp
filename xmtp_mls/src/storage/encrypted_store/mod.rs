@@ -95,6 +95,8 @@ pub trait XmtpDb {
 
     /// Release connection to the database, closing it
     fn release_connection(&self) -> Result<(), StorageError>;
+
+    fn db_path(&self) -> Option<String>;
 }
 
 #[cfg(not(target_arch = "wasm32"))]

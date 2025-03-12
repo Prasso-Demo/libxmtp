@@ -212,4 +212,12 @@ impl XmtpDb for NativeDb {
 
         Ok(())
     }
+
+    fn db_path(&self) -> Option<String> {
+        let StorageOption::Persistent(path) = &self.opts else {
+            return None;
+        };
+
+        Some(path.clone())
+    }
 }

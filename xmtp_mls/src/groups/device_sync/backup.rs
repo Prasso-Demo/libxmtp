@@ -1,6 +1,7 @@
 use super::DeviceSyncError;
 use crate::storage::xmtp_openmls_provider::XmtpOpenMlsProvider;
 use backup_exporter::BackupExporter;
+use openmls_traits::OpenMlsProvider;
 use std::{path::Path, sync::Arc};
 use thiserror::Error;
 use xmtp_common::time::now_ns;
@@ -14,6 +15,7 @@ const BACKUP_VERSION: u16 = 0;
 mod backup_exporter;
 mod backup_importer;
 mod export_stream;
+mod hard_backup;
 
 #[derive(Debug, Error)]
 pub enum BackupError {
@@ -67,6 +69,7 @@ impl BackupOptions {
         key: &[u8],
     ) -> Result<(), DeviceSyncError> {
         let provider = Arc::new(provider);
+
         let mut exporter = BackupExporter::new(self, &provider, key);
         exporter.write_to_file(path).await?;
 
