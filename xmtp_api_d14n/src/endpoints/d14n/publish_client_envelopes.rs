@@ -55,10 +55,10 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_inbox_ids() {
+    async fn test_publish_client_envelopes() {
         use xmtp_proto::xmtp::xmtpv4::envelopes::ClientEnvelope;
 
-        let client = crate::TestClient::create_local();
+        let client = crate::TestClient::create_local_d14n();
         let client = client.build().await.unwrap();
 
         let endpoint = PublishClientEnvelopes::builder()

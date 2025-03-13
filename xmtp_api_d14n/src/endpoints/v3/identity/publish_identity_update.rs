@@ -23,7 +23,7 @@ impl PublishIdentityUpdate {
 impl Endpoint for PublishIdentityUpdate {
     type Output = PublishIdentityUpdateResponse;
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/identity/v1/publish-identity-update")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -40,8 +40,8 @@ impl Endpoint for PublishIdentityUpdate {
 
 #[cfg(test)]
 mod test {
-    use xmtp_proto::prelude::*;
     use super::*;
+    use xmtp_proto::prelude::*;
 
     #[test]
     fn test_file_descriptor() {
@@ -68,7 +68,6 @@ mod test {
             .build()
             .unwrap();
 
-        let _: Result<PublishIdentityUpdateResponse, _> =
-            endpoint.query(&client).await;
+        let _: Result<PublishIdentityUpdateResponse, _> = endpoint.query(&client).await;
     }
 }

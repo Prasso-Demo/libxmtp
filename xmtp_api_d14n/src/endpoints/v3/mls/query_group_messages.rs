@@ -25,7 +25,7 @@ impl QueryGroupMessages {
 impl Endpoint for QueryGroupMessages {
     type Output = QueryGroupMessagesResponse;
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/mls/v1/query-group-messages")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -43,9 +43,9 @@ impl Endpoint for QueryGroupMessages {
 
 #[cfg(test)]
 mod test {
-    use xmtp_proto::prelude::*;
-    use xmtp_proto::mls::api::v1::prelude::*;
     use crate::v3::QueryGroupMessages;
+    use xmtp_proto::mls::api::v1::prelude::*;
+    use xmtp_proto::prelude::*;
 
     #[test]
     fn test_file_descriptor() {

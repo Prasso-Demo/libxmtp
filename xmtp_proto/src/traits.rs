@@ -36,6 +36,7 @@ pub trait Client {
     async fn request<T>(
         &self,
         request: http::request::Builder,
+        uri: http::uri::Builder,
         body: Vec<u8>,
     ) -> Result<http::Response<T>, ApiError<Self::Error>>
     where
@@ -88,8 +89,9 @@ where
         } else {
             self.grpc_endpoint()
         };
-        let request = request.uri(endpoint.as_ref());
-        let rsp = client.request::<T>(request, self.body()?).await?;
+        let uri = http::uri::Uri::builder().path_and_query(endpoint.as_ref());
+        debug!("{request:?}");
+        let rsp = client.request::<T>(request, uri, self.body()?).await?;
         Ok(rsp.into_body())
     }
 }
@@ -170,13 +172,32 @@ impl RetryableError for BodyError {
         false
     }
 }
-/*
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock {
     use super::*;
+    use crate::prelude::*;
 
     pub struct MockClient;
     pub struct MockStream;
+    pub struct MockApiBuilder;
+    impl ApiBuilder for MockApiBuilder {
+        type Output = MockClient;
+        type Error = MockError;
+
+        fn set_libxmtp_version(&mut self, _version: String) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_app_version(&mut self, _version: String) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_host(&mut self, _host: String) {}
+        fn set_payer(&mut self, _host: String) {}
+        fn set_tls(&mut self, _tls: bool) {}
+        async fn build(self) -> Result<Self::Output, Self::Error> {
+            Ok(MockClient)
+        }
+    }
 
     #[derive(thiserror::Error, Debug)]
     pub enum MockError {}
@@ -194,14 +215,24 @@ pub mod mock {
             async fn request<T>(
                 &self,
                 request: http::request::Builder,
+                uri: http::uri::Builder,
                 body: Vec<u8>,
-            ) -> Result<http::Response<T>, ApiError<MockError>> where Self: Sized;
+            ) -> Result<http::Response<T>, ApiError<MockError>> where Self: Sized, T: Default + prost::Message + 'static;
 
             async fn stream(
                 &self,
                 request: http::request::Builder,
                 body: Vec<u8>,
             ) -> Result<http::Response<MockStreamT>, ApiError<MockError>>;
+        }
+
+        impl XmtpTestClient for MockClient {
+            type Builder = MockApiBuilder;
+            fn create_local() -> MockApiBuilder { MockApiBuilder }
+            fn create_dev() -> MockApiBuilder { MockApiBuilder }
+            fn create_local_payer() -> MockApiBuilder { MockApiBuilder }
+            fn create_local_d14n() -> MockApiBuilder { MockApiBuilder }
+
         }
     }
 
@@ -213,11 +244,12 @@ pub mod mock {
         impl Client for MockClient {
             type Error = MockError;
             type Stream = MockStreamT;
-            async fn request(
+            async fn request<T>(
                 &self,
                 request: http::request::Builder,
+                uri: http::uri::Builder,
                 body: Vec<u8>,
-            ) -> Result<http::Response<Bytes>, ApiError<MockError>>;
+            ) -> Result<http::Response<T>, ApiError<MockError>> where Self: Sized, T: Default + prost::Message + 'static;
 
             async fn stream(
                 &self,
@@ -225,6 +257,14 @@ pub mod mock {
                 body: Vec<u8>,
             ) -> Result<http::Response<MockStreamT>, ApiError<MockError>>;
         }
+
+        impl XmtpTestClient for MockClient {
+            type Builder = MockApiBuilder;
+            fn create_local() -> () { () }
+            fn create_dev() -> () { () }
+            fn create_local_payer() -> () { () }
+            fn create_local_d14n() -> () { () }
+
+        }
     }
 }
-*/

@@ -24,7 +24,7 @@ impl UploadKeyPackage {
 impl Endpoint for UploadKeyPackage {
     type Output = ();
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/mls/v1/upload-key-package")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {

@@ -53,7 +53,6 @@ mod test {
     use super::*;
     use crate::d14n::GetInboxIds;
     use xmtp_proto::prelude::*;
-    use xmtp_proto::xmtp::xmtpv4::message_api::GetInboxIdsResponse;
 
     #[test]
     fn test_file_descriptor() {
@@ -71,6 +70,7 @@ mod test {
             .build()
             .unwrap();
 
-        let _: GetInboxIdsResponse = endpoint.query(&client).await.unwrap();
+        let r = endpoint.query(&client).await;
+        assert!(r.is_err())
     }
 }

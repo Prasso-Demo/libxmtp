@@ -21,7 +21,7 @@ impl SendGroupMessages {
 impl Endpoint for SendGroupMessages {
     type Output = ();
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/mls/v1/send-group-messages")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -39,8 +39,8 @@ impl Endpoint for SendGroupMessages {
 #[cfg(test)]
 mod test {
     use crate::v3::SendGroupMessages;
-    use xmtp_proto::prelude::*;
     use xmtp_proto::mls::api::v1::prelude::*;
+    use xmtp_proto::prelude::*;
 
     #[test]
     fn test_file_descriptor() {
@@ -49,7 +49,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_identity_updates_v2() {
+    async fn test_send_group_messages() {
         let client = crate::TestClient::create_local();
         let client = client.build().await.unwrap();
         let endpoint = SendGroupMessages::builder()
@@ -57,7 +57,6 @@ mod test {
             .build()
             .unwrap();
 
-        //todo: fix later with better data samples
         let result = endpoint.query(&client).await;
         assert!(result.is_err());
     }

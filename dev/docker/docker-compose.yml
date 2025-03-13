@@ -87,4 +87,4 @@ services:
         condition: service_healthy
     ports:
       - 5050:5050
-
+      - 5055:5055

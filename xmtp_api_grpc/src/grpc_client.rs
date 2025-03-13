@@ -34,6 +34,7 @@ impl Client for GrpcClient {
     async fn request<T>(
         &self,
         request: http::request::Builder,
+        uri: http::uri::Builder,
         body: Vec<u8>,
     ) -> Result<http::Response<T>, ApiError<Self::Error>>
     where

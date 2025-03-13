@@ -14,7 +14,10 @@ extern crate tracing;
 pub use tests::*;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod tests {
-    #[cfg(feature = "grpc-api")]
+    // #[cfg(any(not(feature = "grpc-api"), not(feature = "http-api")))]
+    // pub type TestClient = xmtp_proto::traits::mock::MockClient;
+
+    #[cfg(all(feature = "grpc-api", not(feature = "http-api")))]
     pub type TestClient = xmtp_api_grpc::grpc_client::GrpcClient;
 
     #[cfg(all(feature = "http-api", not(feature = "grpc-api")))]

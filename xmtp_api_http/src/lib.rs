@@ -52,7 +52,7 @@ fn reqwest_builder() -> reqwest::ClientBuilder {
 #[derive(Clone)]
 pub struct XmtpHttpApiClient {
     http_client: reqwest::Client,
-    host_url: http::uri::Uri,
+    host_url: String,
     app_version: String,
     libxmtp_version: String,
 }
@@ -67,7 +67,7 @@ impl XmtpHttpApiClient {
 
         Ok(XmtpHttpApiClient {
             http_client: client,
-            host_url: http::uri::Uri::try_from(host_url)?,
+            host_url,
             app_version,
             libxmtp_version,
         })
@@ -161,7 +161,7 @@ impl ApiBuilder for XmtpHttpApiClientBuilder {
             .ok_or(HttpClientBuilderError::MissingAppVersion)?;
         Ok(XmtpHttpApiClient {
             http_client,
-            host_url: http::uri::Uri::try_from(self.host_url)?,
+            host_url: self.host_url,
             app_version,
             libxmtp_version,
         })

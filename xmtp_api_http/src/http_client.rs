@@ -1,6 +1,6 @@
-use crate::{HttpClientError, XmtpHttpApiClient};
+use crate::{ErrorResponse, HttpClientError, XmtpHttpApiClient};
 use bytes::Bytes;
-use http::{uri::Uri, Response};
+use http::Response;
 use reqwest::Body;
 use std::pin::Pin;
 use xmtp_proto::traits::{ApiError, Client};
@@ -15,24 +15,29 @@ impl XmtpHttpApiClient {
     async fn request<T>(
         &self,
         request: http::request::Builder,
+        uri: http::uri::Builder,
         body: Vec<u8>,
     ) -> Result<http::Response<T>, HttpClientError>
     where
         T: Default + prost::Message + 'static,
         Self: Sized,
     {
-        let mut parts = self.host_url.clone().into_parts();
-        parts.path_and_query = request
-            .uri_ref()
-            .map(|u| u.path_and_query())
-            .flatten()
-            .cloned();
-        let request = request
-            .method("POST")
-            .uri(Uri::from_parts(parts)?)
-            .body(body)?;
-
-        let response: Response<Body> = self.http_client.execute(request.try_into()?).await?.into();
+        let uri = uri
+            .authority(self.host_url.as_str())
+            .scheme(self.host_url.as_str())
+            .build()?;
+        debug!("uri={uri}");
+        let request = request.method("POST").uri(uri).body(body)?;
+        debug!("request={:?}", request);
+        let response = self.http_client.execute(request.try_into()?).await?;
+        if !response.status().is_success() {
+            return Err(HttpClientError::Grpc(ErrorResponse {
+                code: response.status().as_u16() as usize,
+                message: response.text().await.map_err(HttpClientError::from)?,
+                details: vec![],
+            }));
+        }
+        let response: Response<Body> = response.into();
         let (parts, body) = response.into_parts();
         let body = http_body_util::BodyExt::collect(body)
             .await
@@ -49,13 +54,14 @@ impl Client for XmtpHttpApiClient {
     async fn request<T>(
         &self,
         request: http::request::Builder,
+        uri: http::uri::Builder,
         body: Vec<u8>,
     ) -> Result<http::Response<T>, ApiError<Self::Error>>
     where
         T: Default + prost::Message + 'static,
         Self: Sized,
     {
-        Ok(self.request(request, body).await?)
+        Ok(self.request(request, uri, body).await?)
     }
 
     async fn stream(

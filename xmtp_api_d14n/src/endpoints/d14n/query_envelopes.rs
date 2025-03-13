@@ -65,7 +65,7 @@ impl Endpoint for QueryEnvelopes {
     type Output = QueryEnvelopesResponse;
 
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("mls/v2/query-envelopes")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -83,9 +83,9 @@ impl Endpoint for QueryEnvelopes {
 
 #[cfg(test)]
 mod test {
-    use xmtp_proto::prelude::*;
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
+    use xmtp_proto::prelude::*;
 
     #[test]
     fn test_file_descriptor() {
@@ -95,10 +95,11 @@ mod test {
     }
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
-    async fn test_get_inbox_ids() {
+    async fn test_query_envelopes() {
         use crate::d14n::QueryEnvelopes;
 
-        let client = crate::TestClient::create_local();
+        let client = crate::TestClient::create_local_d14n();
+        info!("CLIENT: {}", std::any::type_name::<crate::TestClient>());
         let client = client.build().await.unwrap();
 
         let endpoint = QueryEnvelopes::builder()
@@ -114,7 +115,6 @@ mod test {
         // let result: QueryEnvelopesResponse = endpoint.query(&client).await.unwrap();
         // assert_eq!(result.envelopes.len(), 0);
         //todo: fix later when it was implemented
-        let result = endpoint.query(&client).await;
-        assert!(result.is_err());
+        let result = endpoint.query(&client).await.unwrap();
     }
 }
