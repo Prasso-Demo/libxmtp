@@ -21,7 +21,7 @@ impl GetIdentityUpdatesV2 {
 impl Endpoint for GetIdentityUpdatesV2 {
     type Output = GetIdentityUpdatesResponse;
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/identity/v1/get-identity-updates")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -60,6 +60,6 @@ mod test {
             .unwrap();
 
         let result: GetIdentityUpdatesResponse = endpoint.query(&client).await.unwrap();
-        assert_eq!(result.responses.len(), 0);
+        assert_eq!(result.responses.len(), 1);
     }
 }

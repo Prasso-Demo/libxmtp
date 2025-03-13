@@ -21,7 +21,7 @@ impl SendWelcomeMessages {
 impl Endpoint for SendWelcomeMessages {
     type Output = ();
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/mls/v1/send-welcome-messages")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -51,19 +51,18 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_identity_updates_v2() {
+    async fn test_send_welcome_messages() {
         let welcome_message = WelcomeMessageInput {
             version: Some(welcome_message_input::Version::V1(Default::default())),
         };
-        let  client = crate::TestClient::create_local();
+        let client = crate::TestClient::create_local();
         let client = client.build().await.unwrap();
         let endpoint = SendWelcomeMessages::builder()
             .messages(vec![welcome_message])
             .build()
             .unwrap();
 
-        //todo: fix later when it was implemented
         let result = endpoint.query(&client).await;
-        assert!(result.is_err());
+        assert!(result.is_err())
     }
 }

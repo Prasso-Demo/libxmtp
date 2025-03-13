@@ -50,7 +50,6 @@ impl Endpoint for GetInboxIds {
 mod test {
     use super::*;
     use xmtp_proto::prelude::*;
-    use xmtp_proto::xmtp::identity::api::v1::GetInboxIdsResponse;
 
     #[test]
     fn test_file_descriptor() {
@@ -64,20 +63,14 @@ mod test {
     async fn test_get_inbox_ids() {
         let client = crate::TestClient::create_local();
         let client = client.build().await.unwrap();
-
         let endpoint = GetInboxIds::builder()
-            .addresses(vec!["".to_string()])
+            .addresses(vec![
+                "0xC2e3f813297E7b42a89e0b2FAa66f2034831984f".to_string()
+            ])
             .build()
             .unwrap();
 
-        let result: Result<GetInboxIdsResponse, _> = endpoint.query(&client).await;
-        match result {
-            Ok(response) => {
-                assert_eq!(response.responses.len(), 1);
-            }
-            Err(err) => {
-                panic!("Test failed: {:?}", err);
-            }
-        }
+        let result = endpoint.query(&client).await.unwrap();
+        assert_eq!(result.responses.len(), 1);
     }
 }

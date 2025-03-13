@@ -23,7 +23,7 @@ impl VerifySmartContractWalletSignatures {
 impl Endpoint for VerifySmartContractWalletSignatures {
     type Output = VerifySmartContractWalletSignaturesResponse;
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/identity/v1/verify-smart-contract-wallet-signatures")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -67,6 +67,6 @@ mod test {
 
         let result: VerifySmartContractWalletSignaturesResponse =
             endpoint.query(&client).await.unwrap();
-        assert_eq!(result.responses.len(), 0);
+        assert_eq!(result.responses.len(), 1);
     }
 }

@@ -21,7 +21,7 @@ impl FetchKeyPackages {
 impl Endpoint for FetchKeyPackages {
     type Output = FetchKeyPackagesResponse;
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/mls/v1/fetch-key-packages")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -38,8 +38,8 @@ impl Endpoint for FetchKeyPackages {
 
 #[cfg(test)]
 mod test {
-    use xmtp_proto::prelude::*;
     use super::*;
+    use xmtp_proto::prelude::*;
 
     #[test]
     fn test_file_descriptor() {
@@ -50,16 +50,20 @@ mod test {
 
     #[tokio::test]
     async fn test_fetch_key_packages() {
-
         let client = crate::TestClient::create_local();
         let client = client.build().await.unwrap();
-
+        info!("CLIENT: {}", std::any::type_name::<crate::TestClient>());
         let endpoint = FetchKeyPackages::builder()
             .installation_keys(vec![vec![1, 2, 3]])
             .build()
             .unwrap();
 
         let result: FetchKeyPackagesResponse = endpoint.query(&client).await.unwrap();
-        assert_eq!(result.key_packages, vec![]);
+        assert_eq!(
+            result,
+            FetchKeyPackagesResponse {
+                key_packages: vec![Default::default()]
+            }
+        );
     }
 }

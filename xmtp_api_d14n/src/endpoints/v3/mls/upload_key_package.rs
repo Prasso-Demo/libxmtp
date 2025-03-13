@@ -24,7 +24,7 @@ impl UploadKeyPackage {
 impl Endpoint for UploadKeyPackage {
     type Output = ();
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/mls/v1/upload-key-package")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -43,8 +43,8 @@ impl Endpoint for UploadKeyPackage {
 #[cfg(test)]
 mod test {
     use crate::v3::UploadKeyPackage;
-    use xmtp_proto::prelude::*;
     use xmtp_proto::mls::api::v1::prelude::*;
+    use xmtp_proto::prelude::*;
 
     #[test]
     fn test_file_descriptor() {

@@ -26,7 +26,7 @@ impl Endpoint for QueryWelcomeMessages {
     type Output = QueryWelcomeMessagesResponse;
 
     fn http_endpoint(&self) -> Cow<'static, str> {
-        todo!()
+        Cow::Borrowed("/mls/v1/query-welcome-messages")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {

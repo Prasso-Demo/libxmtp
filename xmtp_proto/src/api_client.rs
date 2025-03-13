@@ -21,6 +21,8 @@ use std::sync::Arc;
 pub trait XmtpTestClient {
     type Builder: ApiBuilder;
     fn create_local() -> Self::Builder;
+    fn create_local_d14n() -> Self::Builder;
+    fn create_local_payer() -> Self::Builder;
     fn create_dev() -> Self::Builder;
 }
 
