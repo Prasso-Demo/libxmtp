@@ -106,8 +106,7 @@ mod not_wasm {
         fn set_app_version(&mut self, version: String) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn set_host(&mut self, host: String) {
-        }
+        fn set_host(&mut self, host: String) {}
         fn set_payer(&mut self, _host: String) {}
         fn set_tls(&mut self, tls: bool) {}
         async fn build(self) -> Result<Self::Output, Self::Error> {

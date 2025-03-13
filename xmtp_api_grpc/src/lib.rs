@@ -145,7 +145,6 @@ impl xmtp_proto::XmtpApiError for GrpcError {
     }
 }
 
-
 #[cfg(test)]
 pub mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};

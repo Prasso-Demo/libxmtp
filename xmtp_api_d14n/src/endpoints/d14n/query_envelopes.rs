@@ -65,7 +65,7 @@ impl Endpoint for QueryEnvelopes {
     type Output = QueryEnvelopesResponse;
 
     fn http_endpoint(&self) -> Cow<'static, str> {
-        Cow::Borrowed("mls/v2/query-envelopes")
+        Cow::Borrowed("/mls/v2/query-envelopes")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -112,9 +112,7 @@ mod test {
             .build()
             .unwrap();
 
-        // let result: QueryEnvelopesResponse = endpoint.query(&client).await.unwrap();
-        // assert_eq!(result.envelopes.len(), 0);
-        //todo: fix later when it was implemented
-        let result = endpoint.query(&client).await.unwrap();
+        let result = endpoint.query(&client).await;
+        assert!(result.is_err());
     }
 }

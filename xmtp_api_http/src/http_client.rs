@@ -22,9 +22,10 @@ impl XmtpHttpApiClient {
         T: Default + prost::Message + 'static,
         Self: Sized,
     {
+        let parts = http::uri::Uri::try_from(&self.host_url)?.into_parts();
         let uri = uri
-            .authority(self.host_url.as_str())
-            .scheme(self.host_url.as_str())
+            .scheme(parts.scheme.unwrap())
+            .authority(parts.authority.unwrap())
             .build()?;
         debug!("uri={uri}");
         let request = request.method("POST").uri(uri).body(body)?;

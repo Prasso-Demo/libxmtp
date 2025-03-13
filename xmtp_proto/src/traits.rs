@@ -90,7 +90,6 @@ where
             self.grpc_endpoint()
         };
         let uri = http::uri::Uri::builder().path_and_query(endpoint.as_ref());
-        debug!("{request:?}");
         let rsp = client.request::<T>(request, uri, self.body()?).await?;
         Ok(rsp.into_body())
     }
