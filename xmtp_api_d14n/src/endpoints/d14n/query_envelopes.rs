@@ -99,7 +99,6 @@ mod test {
         use crate::d14n::QueryEnvelopes;
 
         let client = crate::TestClient::create_local_d14n();
-        info!("CLIENT: {}", std::any::type_name::<crate::TestClient>());
         let client = client.build().await.unwrap();
 
         let endpoint = QueryEnvelopes::builder()

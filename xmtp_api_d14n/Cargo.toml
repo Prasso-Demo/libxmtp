@@ -34,7 +34,7 @@ xmtp_api_http = { workspace = true, features = ["test-utils"] }
 tokio.workspace = true
 
 [features]
-default = []
+default = ["grpc-api"]
 http-api = ["dep:xmtp_api_http", "xmtp_proto/http-api"]
 grpc-api = ["dep:xmtp_api_grpc", "xmtp_proto/grpc-api"]
 test-utils = []

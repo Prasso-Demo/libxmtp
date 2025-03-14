@@ -9,7 +9,7 @@ use xmtp_id::{
     },
     InboxOwner,
 };
-use xmtp_proto::api_client::XmtpTestClient;
+use xmtp_proto::api_client::{ApiBuilder, XmtpTestClient};
 
 pub type BenchClient = Client<TestApiClient>;
 

@@ -78,7 +78,7 @@ impl XmtpHttpApiClient {
     }
 
     fn endpoint(&self, endpoint: &str) -> String {
-        format!("{}{}", self.host_url.to_string(), endpoint)
+        format!("{}{}", self.host_url, endpoint)
     }
 
     pub fn app_version(&self) -> &str {

@@ -24,12 +24,12 @@ impl XmtpHttpApiClient {
     {
         let parts = http::uri::Uri::try_from(&self.host_url)?.into_parts();
         let uri = uri
-            .scheme(parts.scheme.unwrap())
-            .authority(parts.authority.unwrap())
+            .scheme(parts.scheme.unwrap_or("http".try_into()?))
+            .authority(parts.authority.unwrap_or("localhost".try_into()?))
             .build()?;
-        debug!("uri={uri}");
+        trace!("uri={uri}");
         let request = request.method("POST").uri(uri).body(body)?;
-        debug!("request={:?}", request);
+        trace!("request={:?}", request);
         let response = self.http_client.execute(request.try_into()?).await?;
         if !response.status().is_success() {
             return Err(HttpClientError::Grpc(ErrorResponse {

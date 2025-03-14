@@ -55,8 +55,11 @@ impl Client for GrpcClient {
 
         let request = request.body(body)?;
         let (parts, body) = request.into_parts();
-        //TODO: HANDLE
-        let path = parts.uri.into_parts().path_and_query.expect("must exist");
+        let path = uri
+            .build()?
+            .into_parts()
+            .path_and_query
+            .expect("must exist");
         let mut tonic_request = tonic::Request::from_parts(
             MetadataMap::from_headers(parts.headers),
             parts.extensions,

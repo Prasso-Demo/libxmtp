@@ -100,15 +100,15 @@ mod not_wasm {
         type Output = ApiClient;
         type Error = MockError;
 
-        fn set_libxmtp_version(&mut self, version: String) -> Result<(), Self::Error> {
+        fn set_libxmtp_version(&mut self, _version: String) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn set_app_version(&mut self, version: String) -> Result<(), Self::Error> {
+        fn set_app_version(&mut self, _version: String) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn set_host(&mut self, host: String) {}
+        fn set_host(&mut self, _host: String) {}
         fn set_payer(&mut self, _host: String) {}
-        fn set_tls(&mut self, tls: bool) {}
+        fn set_tls(&mut self, _tls: bool) {}
         async fn build(self) -> Result<Self::Output, Self::Error> {
             Ok(ApiClient)
         }
@@ -166,6 +166,8 @@ mod not_wasm {
             type Builder = MockApiBuilder;
             fn create_local() -> MockApiBuilder { MockApiBuilder }
             fn create_dev() -> MockApiBuilder { MockApiBuilder }
+            fn create_local_d14n() -> MockApiBuilder { MockApiBuilder }
+            fn create_local_payer() -> MockApiBuilder { MockApiBuilder }
         }
     }
 }

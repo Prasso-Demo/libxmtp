@@ -52,7 +52,6 @@ mod test {
     async fn test_fetch_key_packages() {
         let client = crate::TestClient::create_local();
         let client = client.build().await.unwrap();
-        info!("CLIENT: {}", std::any::type_name::<crate::TestClient>());
         let endpoint = FetchKeyPackages::builder()
             .installation_keys(vec![vec![1, 2, 3]])
             .build()
