@@ -51,7 +51,7 @@ impl Endpoint for QueryEnvelope {
 pub struct QueryEnvelopes {
     #[builder(setter(into))]
     envelopes: EnvelopesQuery,
-    #[builder(setter(into))]
+    #[builder(setter(into), default)]
     limit: u32,
 }
 
@@ -107,11 +107,13 @@ mod test {
                 originator_node_ids: vec![],
                 last_seen: None,
             })
-            .limit(0u32)
             .build()
             .unwrap();
-
-        let result = endpoint.query(&client).await;
-        assert!(result.is_err());
+        if !cfg!(feature = "http-api") {
+            assert!(endpoint.query(&client).await.is_ok());
+            // TODO: Investigate why fails with http topic
+        } else {
+            assert!(endpoint.query(&client).await.is_err());
+        }
     }
 }

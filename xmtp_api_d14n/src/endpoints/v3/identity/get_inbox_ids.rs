@@ -65,7 +65,7 @@ mod test {
         let client = client.build().await.unwrap();
         let endpoint = GetInboxIds::builder()
             .addresses(vec![
-                "0xC2e3f813297E7b42a89e0b2FAa66f2034831984f".to_string()
+                "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".to_string()
             ])
             .build()
             .unwrap();

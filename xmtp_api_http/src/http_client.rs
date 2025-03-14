@@ -31,6 +31,7 @@ impl XmtpHttpApiClient {
         let request = request.method("POST").uri(uri).body(body)?;
         trace!("request={:?}", request);
         let response = self.http_client.execute(request.try_into()?).await?;
+
         if !response.status().is_success() {
             return Err(HttpClientError::Grpc(ErrorResponse {
                 code: response.status().as_u16() as usize,

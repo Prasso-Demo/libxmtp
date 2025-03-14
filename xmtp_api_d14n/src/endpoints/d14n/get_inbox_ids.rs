@@ -13,6 +13,8 @@ use xmtp_proto::xmtp::xmtpv4::message_api::{
 pub struct GetInboxIds {
     #[builder(setter(into))]
     addresses: Vec<String>,
+    #[builder(setter(into), default)]
+    passkeys: Vec<String>,
 }
 
 impl GetInboxIds {
@@ -33,14 +35,23 @@ impl Endpoint for GetInboxIds {
     }
 
     fn body(&self) -> Result<Vec<u8>, BodyError> {
+        let addresses = self
+            .addresses
+            .iter()
+            .cloned()
+            .map(|a| (a, IdentifierKind::Ethereum));
+        let passkeys = self
+            .passkeys
+            .iter()
+            .cloned()
+            .map(|p| (p, IdentifierKind::Passkey));
+
         Ok(GetInboxIdsRequest {
-            requests: self
-                .addresses
-                .iter()
-                .cloned()
-                .map(|i| get_inbox_ids_request::Request {
+            requests: addresses
+                .chain(passkeys)
+                .map(|(i, kind)| get_inbox_ids_request::Request {
                     identifier: i,
-                    identifier_kind: IdentifierKind::Ethereum as i32,
+                    identifier_kind: kind as i32,
                 })
                 .collect(),
         }
@@ -66,11 +77,12 @@ mod test {
         let client = client.build().await.unwrap();
 
         let endpoint = GetInboxIds::builder()
-            .addresses(vec!["".to_string()])
+            .addresses(vec![
+                "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".to_string()
+            ])
             .build()
             .unwrap();
 
-        let r = endpoint.query(&client).await;
-        assert!(r.is_err())
+        assert!(endpoint.query(&client).await.is_ok());
     }
 }

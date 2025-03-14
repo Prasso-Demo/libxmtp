@@ -20,7 +20,7 @@ pub mod tests {
     #[cfg(all(feature = "grpc-api", not(feature = "http-api")))]
     pub type TestClient = xmtp_api_grpc::grpc_client::GrpcClient;
 
-    #[cfg(all(feature = "http-api", not(feature = "grpc-api")))]
+    #[cfg(all(feature = "http-api"))]
     pub type TestClient = xmtp_api_http::XmtpHttpApiClient;
 
     // Execute once before any tests are run

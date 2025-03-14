@@ -66,6 +66,7 @@ impl Client for GrpcClient {
             body,
         );
         let metadata = tonic_request.metadata_mut();
+
         // must be lowercase otherwise panics
         metadata.append("x-app-version", self.app_version.clone());
         metadata.append("x-libxmtp-version", self.libxmtp_version.clone());

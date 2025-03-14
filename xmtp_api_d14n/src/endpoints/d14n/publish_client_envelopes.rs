@@ -24,7 +24,7 @@ impl PublishClientEnvelopes {
 impl Endpoint for PublishClientEnvelopes {
     type Output = PublishClientEnvelopesResponse;
     fn http_endpoint(&self) -> Cow<'static, str> {
-        Cow::from("/mls/v2/publish-payer-envelopes")
+        Cow::from("/mls/v2/payer/publish-client-envelopes")
     }
 
     fn grpc_endpoint(&self) -> Cow<'static, str> {
@@ -58,7 +58,7 @@ mod test {
     async fn test_publish_client_envelopes() {
         use xmtp_proto::xmtp::xmtpv4::envelopes::ClientEnvelope;
 
-        let client = crate::TestClient::create_local_d14n();
+        let client = crate::TestClient::create_local_payer();
         let client = client.build().await.unwrap();
 
         let endpoint = PublishClientEnvelopes::builder()
@@ -66,9 +66,6 @@ mod test {
             .build()
             .unwrap();
 
-        // let result: PublishClientEnvelopesResponse = endpoint.query(&client).await.unwrap();
-        // assert_eq!(result.originator_envelopes.len(), 0);
-        //todo: fix later when it was implemented
         let result = endpoint.query(&client).await;
         assert!(result.is_err());
     }
