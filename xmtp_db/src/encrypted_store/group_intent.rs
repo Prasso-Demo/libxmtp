@@ -10,10 +10,10 @@ use diesel::{
 use xmtp_common::fmt;
 
 use super::{
-    Sqlite,
+    ConnectionExt, Sqlite,
     db_connection::DbConnection,
     group,
-    schema::{group_intents, group_intents::dsl},
+    schema::group_intents::{self, dsl},
 };
 use crate::{
     Delete, impl_fetch, impl_store, {NotFound, StorageError},
@@ -54,6 +54,7 @@ pub enum IntentState {
     Published = 2,
     Committed = 3,
     Error = 4,
+    Processed = 5,
 }
 
 #[derive(Queryable, Identifiable, PartialEq, Clone)]
@@ -157,17 +158,17 @@ impl NewGroupIntent {
     }
 }
 
-impl DbConnection {
+impl<C: ConnectionExt> DbConnection<C> {
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn insert_group_intent(
         &self,
         to_save: NewGroupIntent,
-    ) -> Result<StoredGroupIntent, StorageError> {
-        Ok(self.raw_query_write(|conn| {
+    ) -> Result<StoredGroupIntent, crate::ConnectionError> {
+        self.raw_query_write(|conn| {
             diesel::insert_into(dsl::group_intents)
                 .values(to_save)
                 .get_result(conn)
-        })?)
+        })
     }
 
     // Query for group_intents by group_id, optionally filtering by state and kind
@@ -177,7 +178,7 @@ impl DbConnection {
         group_id: Vec<u8>,
         allowed_states: Option<Vec<IntentState>>,
         allowed_kinds: Option<Vec<IntentKind>>,
-    ) -> Result<Vec<StoredGroupIntent>, StorageError> {
+    ) -> Result<Vec<StoredGroupIntent>, crate::ConnectionError> {
         let mut query = dsl::group_intents
             .into_boxed()
             .filter(dsl::group_id.eq(group_id));
@@ -192,7 +193,7 @@ impl DbConnection {
 
         query = query.order(dsl::id.asc());
 
-        Ok(self.raw_query_read(|conn| query.load::<StoredGroupIntent>(conn))?)
+        self.raw_query_read(|conn| query.load::<StoredGroupIntent>(conn))
     }
 
     // Set the intent with the given ID to `Published` and set the payload hash. Optionally add
@@ -239,7 +240,7 @@ impl DbConnection {
 
     // Set the intent with the given ID to `Committed`
     pub fn set_group_intent_committed(&self, intent_id: ID) -> Result<(), StorageError> {
-        let rows_changed = self.raw_query_write(|conn| {
+        let rows_changed: usize = self.raw_query_write(|conn| {
             diesel::update(dsl::group_intents)
                 .filter(dsl::id.eq(intent_id))
                 // State machine requires that the only valid state transition to Committed is from
@@ -252,6 +253,25 @@ impl DbConnection {
         // If nothing matched the query, return an error. Either ID or state was wrong
         if rows_changed == 0 {
             return Err(NotFound::IntentForCommitted(intent_id).into());
+        }
+
+        Ok(())
+    }
+
+    // Set the intent with the given ID to `Committed`
+    pub fn set_group_intent_processed(&self, intent_id: ID) -> Result<(), StorageError> {
+        let rows_changed = self.raw_query_write(|conn| {
+            diesel::update(dsl::group_intents)
+                .filter(dsl::id.eq(intent_id))
+                // State machine requires that the only valid state transition to Committed is from
+                // Published
+                .set(dsl::state.eq(IntentState::Processed))
+                .execute(conn)
+        })?;
+
+        // If nothing matched the query, return an error. Either ID or state was wrong
+        if rows_changed == 0 {
+            return Err(NotFound::IntentById(intent_id).into());
         }
 
         Ok(())
@@ -390,6 +410,7 @@ where
             2 => Ok(IntentState::Published),
             3 => Ok(IntentState::Committed),
             4 => Ok(IntentState::Error),
+            5 => Ok(IntentState::Processed),
             x => Err(format!("Unrecognized variant {}", x).into()),
         }
     }

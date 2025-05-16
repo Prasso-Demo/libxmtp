@@ -10,16 +10,16 @@ use std::ops::Deref;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use xmtp_api::ApiDebugWrapper;
 pub use xmtp_api_grpc::grpc_api_helper::Client as TonicApiClient;
-use xmtp_db::{EncryptedMessageStore, EncryptionKey, StorageOption};
+use xmtp_db::{EncryptedMessageStore, EncryptionKey, NativeDb, StorageOption};
 use xmtp_id::associations::builder::SignatureRequest;
 use xmtp_mls::builder::SyncWorkerMode as XmtpSyncWorkerMode;
 use xmtp_mls::groups::scoped_client::LocalScopedGroupClient;
 use xmtp_mls::identity::IdentityStrategy;
 use xmtp_mls::Client as MlsClient;
-use xmtp_proto::xmtp::mls::message_contents::DeviceSyncKind;
 
-pub type RustXmtpClient = MlsClient<TonicApiClient>;
+pub type RustXmtpClient = MlsClient<ApiDebugWrapper<TonicApiClient>>;
 static LOGGER_INIT: std::sync::OnceLock<Result<()>> = std::sync::OnceLock::new();
 
 #[napi]
@@ -162,13 +162,16 @@ pub async fn create_client(
       let key: EncryptionKey = key
         .try_into()
         .map_err(|_| Error::from_reason("Malformed 32 byte encryption key"))?;
-      EncryptedMessageStore::new(storage_option, key)
-        .await
+      let db = NativeDb::new(&storage_option, key)
+        .map_err(|e| Error::from_reason(format!("Error creating native database {}", e)))?;
+      EncryptedMessageStore::new(db)
         .map_err(|e| Error::from_reason(format!("Error Creating Encrypted Message store {}", e)))?
     }
-    None => EncryptedMessageStore::new_unencrypted(storage_option)
-      .await
-      .map_err(|e| Error::from_reason(format!("{e} Error creating unencrypted message store")))?,
+    None => {
+      let db = NativeDb::new_unencrypted(&storage_option)
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+      EncryptedMessageStore::new(db).map_err(|e| Error::from_reason(e.to_string()))?
+    }
   };
 
   let internal_account_identifier = account_identifier.clone().try_into()?;
@@ -183,6 +186,8 @@ pub async fn create_client(
   let mut builder = match device_sync_server_url {
     Some(url) => xmtp_mls::Client::builder(identity_strategy)
       .api_client(api_client)
+      .enable_api_debug_wrapper()
+      .map_err(ErrorWrapper::from)?
       .with_remote_verifier()
       .map_err(ErrorWrapper::from)?
       .store(store)
@@ -190,6 +195,8 @@ pub async fn create_client(
 
     None => xmtp_mls::Client::builder(identity_strategy)
       .api_client(api_client)
+      .enable_api_debug_wrapper()
+      .map_err(ErrorWrapper::from)?
       .with_remote_verifier()
       .map_err(ErrorWrapper::from)?
       .store(store),
@@ -282,23 +289,10 @@ impl Client {
   }
 
   #[napi]
-  pub async fn send_history_sync_request(&self) -> Result<()> {
-    self.send_sync_request(DeviceSyncKind::MessageHistory).await
-  }
-
-  #[napi]
-  pub async fn send_consent_sync_request(&self) -> Result<()> {
-    self.send_sync_request(DeviceSyncKind::Consent).await
-  }
-
-  async fn send_sync_request(&self, kind: DeviceSyncKind) -> Result<()> {
-    let provider = self
-      .inner_client
-      .mls_provider()
-      .map_err(ErrorWrapper::from)?;
+  pub async fn send_sync_request(&self) -> Result<()> {
     self
       .inner_client
-      .send_sync_request(&provider, kind)
+      .send_sync_request()
       .await
       .map_err(ErrorWrapper::from)?;
 
@@ -310,11 +304,7 @@ impl Client {
     &self,
     identifier: Identifier,
   ) -> Result<Option<String>> {
-    let conn = self
-      .inner_client()
-      .store()
-      .conn()
-      .map_err(ErrorWrapper::from)?;
+    let conn = self.inner_client().store().db();
 
     let inbox_id = self
       .inner_client
@@ -346,10 +336,8 @@ impl Client {
   pub async fn sync_preferences(&self) -> Result<u32> {
     let inner = self.inner_client.as_ref();
 
-    let provider = inner.mls_provider().map_err(ErrorWrapper::from)?;
-
     let num_groups_synced: usize = inner
-      .sync_all_welcomes_and_history_sync_groups(&provider)
+      .sync_all_welcomes_and_history_sync_groups()
       .await
       .map_err(ErrorWrapper::from)?;
 

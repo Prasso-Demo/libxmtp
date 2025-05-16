@@ -1,18 +1,16 @@
 //! Api Client Traits
 
+use crate::api_client::AggregateStats;
 use http::{request, uri::PathAndQuery};
 use prost::bytes::Bytes;
 use std::borrow::Cow;
 use thiserror::Error;
 use xmtp_common::{retry_async, retryable, BoxedRetry, RetryableError};
 
-use crate::{api_client::ApiStats, ApiEndpoint, ProtoError};
+use crate::{ApiEndpoint, ProtoError};
 
 pub trait HasStats {
-    fn stats(&self) -> &ApiStats;
-}
-pub trait HasIdentityStats {
-    fn identity_stats(&self) -> crate::api_client::IdentityStats;
+    fn aggregate_stats(&self) -> AggregateStats;
 }
 
 pub trait Endpoint {
@@ -146,8 +144,24 @@ where
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ApiClientError<E: std::error::Error> {
+    #[error(
+        "api client at endpoint \"{}\" has error {}. \n {:?} \n",
+        endpoint,
+        source,
+        stats
+    )]
+    ClientWithEndpointAndStats {
+        endpoint: String,
+        source: E,
+        stats: AggregateStats,
+    },
+    #[error("API Error {}, \n {:?} \n", e, stats)]
+    ErrorWithStats {
+        e: Box<dyn RetryableError + Send + Sync>,
+        stats: AggregateStats,
+    },
     /// The client encountered an error.
-    #[error("client at \"{}\" has error {}", endpoint, source)]
+    #[error("api client at endpoint \"{}\" has error {}", endpoint, source)]
     ClientWithEndpoint {
         endpoint: String,
         /// The client error.
@@ -178,7 +192,9 @@ where
     fn is_retryable(&self) -> bool {
         use ApiClientError::*;
         match self {
-            Client { source } => retryable!(source),
+            ClientWithEndpointAndStats { source, .. } => retryable!(source),
+            ErrorWithStats { e, .. } => retryable!(e),
+            Client { source } => retryable!(*source),
             ClientWithEndpoint { source, .. } => retryable!(source),
             Body(e) => retryable!(e),
             Http(_) => true,
@@ -194,7 +210,7 @@ where
 // Infallible errors by definition can never occur
 impl<E: std::error::Error> From<std::convert::Infallible> for ApiClientError<E> {
     fn from(_v: std::convert::Infallible) -> ApiClientError<E> {
-        unreachable!()
+        unreachable!("Infallible errors can never occur")
     }
 }
 

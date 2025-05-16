@@ -5,8 +5,8 @@ use futures::StreamExt;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::OnceCell;
-use xmtp_db::StorageError;
-use xmtp_id::scw_verifier::SmartContractSignatureVerifier;
+use tracing::instrument;
+use xmtp_db::{StorageError, XmtpDb};
 use xmtp_proto::api_client::trait_impls::XmtpApi;
 
 /// Interval at which the DisappearingMessagesCleanerWorker runs to delete expired messages.
@@ -29,17 +29,37 @@ impl DisappearingMessagesCleanerError {
     }
 }
 
-pub struct DisappearingMessagesCleanerWorker<ApiClient, V> {
-    client: Client<ApiClient, V>,
+impl<ApiClient, Db> Client<ApiClient, Db>
+where
+    ApiClient: XmtpApi + Send + Sync + 'static,
+    Db: xmtp_db::XmtpDb + 'static,
+{
+    #[instrument(level = "trace", skip_all)]
+    pub fn start_disappearing_messages_cleaner_worker(&self) {
+        let client = self.clone();
+        tracing::trace!(
+            inbox_id = client.inbox_id(),
+            installation_id = hex::encode(client.installation_public_key()),
+            "starting expired messages cleaner worker"
+        );
+
+        let worker = DisappearingMessagesCleanerWorker::new(client);
+        worker.spawn_worker();
+    }
+}
+
+pub struct DisappearingMessagesCleanerWorker<ApiClient, Db> {
+    client: Client<ApiClient, Db>,
     #[allow(dead_code)]
     init: OnceCell<()>,
 }
-impl<ApiClient, V> DisappearingMessagesCleanerWorker<ApiClient, V>
+
+impl<ApiClient, Db> DisappearingMessagesCleanerWorker<ApiClient, Db>
 where
     ApiClient: XmtpApi + Send + Sync + 'static,
-    V: SmartContractSignatureVerifier + Send + Sync + 'static,
+    Db: XmtpDb + Send + Sync + 'static,
 {
-    pub fn new(client: Client<ApiClient, V>) -> Self {
+    pub fn new(client: Client<ApiClient, Db>) -> Self {
         Self {
             client,
             init: OnceCell::new(),
@@ -68,15 +88,15 @@ where
     }
 }
 
-impl<ApiClient, V> DisappearingMessagesCleanerWorker<ApiClient, V>
+impl<ApiClient, Db> DisappearingMessagesCleanerWorker<ApiClient, Db>
 where
     ApiClient: XmtpApi + Send + Sync + 'static,
-    V: SmartContractSignatureVerifier + Send + Sync + 'static,
+    Db: XmtpDb + Send + Sync + 'static,
 {
     /// Iterate on the list of groups and delete expired messages
     async fn delete_expired_messages(&mut self) -> Result<(), DisappearingMessagesCleanerError> {
-        let provider = self.client.mls_provider()?;
-        match provider.conn_ref().delete_expired_messages() {
+        let provider = self.client.mls_provider();
+        match provider.db().delete_expired_messages() {
             Ok(deleted_count) if deleted_count > 0 => {
                 tracing::info!("Successfully deleted {} expired messages", deleted_count);
             }

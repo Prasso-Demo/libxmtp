@@ -1,17 +1,15 @@
 use super::*;
 use crate::{Client, XmtpApi};
-use xmtp_id::scw_verifier::SmartContractSignatureVerifier;
 
-impl<ApiClient, V> Client<ApiClient, V>
+impl<ApiClient, Db> Client<ApiClient, Db>
 where
     ApiClient: XmtpApi,
-    V: SmartContractSignatureVerifier,
+    Db: XmtpDb,
 {
-    pub(super) fn syncable_consent_records(
-        &self,
-        conn: &DbConnection,
-    ) -> Result<Vec<Syncable>, DeviceSyncError> {
-        let consent_records = conn
+    pub(super) fn syncable_consent_records(&self) -> Result<Vec<Syncable>, DeviceSyncError> {
+        let consent_records = self
+            .context
+            .db()
             .consent_records()?
             .into_iter()
             .map(Syncable::ConsentRecord)
@@ -27,7 +25,7 @@ pub(crate) mod tests {
 
     use crate::{
         groups::{device_sync::handle::SyncMetric, scoped_client::ScopedGroupClient},
-        utils::tester::{Tester, XmtpClientWalletTester},
+        utils::tester::*,
     };
     use xmtp_db::consent_record::{ConsentState, ConsentType, StoredConsentRecord};
 
@@ -51,12 +49,12 @@ pub(crate) mod tests {
 
         // Ensure that consent record now exists.
         let syncable_consent_records = amal_a
-            .syncable_consent_records(amal_a.provider.conn_ref())
+            .syncable_consent_records(amal_a.provider.db())
             .unwrap();
         assert_eq!(syncable_consent_records.len(), 1);
 
         // Create a second installation for amal with sync.
-        let amal_b = amal_a.new_installation().await;
+        let amal_b = amal_a.builder.build().await;
 
         amal_b
             .worker()
@@ -65,16 +63,13 @@ pub(crate) mod tests {
             .unwrap();
 
         let consent_records_b = amal_b
-            .syncable_consent_records(amal_b.provider.conn_ref())
+            .syncable_consent_records(amal_b.provider.db())
             .unwrap();
         assert_eq!(consent_records_b.len(), 0);
 
-        amal_a
-            .get_sync_group(&amal_a.provider)
-            .unwrap()
-            .sync()
-            .await
-            .unwrap();
+        amal_a.test_has_same_sync_group_as(&amal_b).await.unwrap();
+
+        amal_a.get_sync_group().unwrap().sync().await.unwrap();
         amal_a
             .worker()
             .wait(SyncMetric::V1PayloadSent, 1)
@@ -82,12 +77,7 @@ pub(crate) mod tests {
             .unwrap();
 
         // Have amal_a receive the message (and auto-process)
-        amal_b
-            .get_sync_group(&amal_b.provider)
-            .unwrap()
-            .sync()
-            .await
-            .unwrap();
+        amal_b.get_sync_group().unwrap().sync().await.unwrap();
         amal_b
             .worker()
             .wait(SyncMetric::V1PayloadProcessed, 1)
@@ -95,13 +85,13 @@ pub(crate) mod tests {
             .unwrap();
 
         // Test consent streaming
-        let amal_b_sync_group = amal_b.get_sync_group(&amal_b.provider).unwrap();
+        let amal_b_sync_group = amal_b.get_sync_group().unwrap();
         let bo_wallet = generate_local_wallet();
 
         // Ensure bo is not consented with amal_b
         let bo_consent_with_amal_b = amal_b
             .provider
-            .conn_ref()
+            .db()
             .get_consent_record(bo_wallet.get_inbox_id(0), ConsentType::InboxId)
             .unwrap();
         assert!(bo_consent_with_amal_b.is_none());
@@ -123,10 +113,7 @@ pub(crate) mod tests {
         let amal_a_subscription = amal_a.local_events().subscribe();
 
         // Wait for the consent to get streamed to the amal_b
-        amal_b_sync_group
-            .sync_with_conn(&amal_b.provider)
-            .await
-            .unwrap();
+        amal_b_sync_group.sync_with_conn().await.unwrap();
         amal_b
             .worker()
             .wait(SyncMetric::V1ConsentReceived, 1)

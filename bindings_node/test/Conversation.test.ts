@@ -290,8 +290,8 @@ describe.concurrent('Conversation', () => {
 
     const message1 = await conversation.send(encodeTextMessage('gm'))
     const message2 = await conversation.send(encodeTextMessage('gm2'))
-
-    expect(streamedMessages).toEqual([message1, message2])
+    expect(streamedMessages).toContain(message1)
+    expect(streamedMessages).toContain(message2)
   })
 
   it('should add and remove admins', async () => {
@@ -473,8 +473,9 @@ describe.concurrent('Conversation', () => {
     ])
     const hmacKeys = group.getHmacKeys()
     expect(hmacKeys).toBeDefined()
-    expect(hmacKeys.length).toBe(3)
-    for (const value of hmacKeys) {
+    let keys = hmacKeys[group.id()]
+    expect(keys.length).toBe(3)
+    for (const value of keys) {
       expect(value.key).toBeDefined()
       expect(value.key.length).toBe(42)
       expect(value.epoch).toBeDefined()

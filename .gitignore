@@ -170,3 +170,8 @@ chain_urls.json
 
 # Mise Configs
 .mise.toml
+.emacs.desktop
+emsdk/**
+emsdk
+result
+archive.xmtp

@@ -15,6 +15,7 @@ diesel::table! {
         entity_type -> Integer,
         state -> Integer,
         entity -> Text,
+        consented_at_ns -> BigInt,
     }
 }
 
@@ -49,6 +50,8 @@ diesel::table! {
         version_major -> Integer,
         authority_id -> Text,
         reference_id -> Nullable<Binary>,
+        sequence_id -> Nullable<BigInt>,
+        originator_id -> Nullable<BigInt>,
     }
 }
 
@@ -67,6 +70,20 @@ diesel::table! {
         message_disappear_from_ns -> Nullable<BigInt>,
         message_disappear_in_ns -> Nullable<BigInt>,
         paused_for_version -> Nullable<Text>,
+        maybe_forked -> Bool,
+        fork_details -> Text,
+        sequence_id -> Nullable<BigInt>,
+        originator_id -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    icebox (sequence_id, originator_id) {
+        sequence_id -> BigInt,
+        originator_id -> BigInt,
+        depending_sequence_id -> Nullable<BigInt>,
+        depending_originator_id -> Nullable<BigInt>,
+        envelope_payload -> Binary,
     }
 }
 
@@ -120,6 +137,12 @@ diesel::table! {
 }
 
 diesel::table! {
+    processed_device_sync_messages (message_id) {
+        message_id -> Binary,
+    }
+}
+
+diesel::table! {
     refresh_state (entity_id, entity_kind) {
         entity_id -> Binary,
         entity_kind -> Integer,
@@ -131,6 +154,7 @@ diesel::table! {
     user_preferences (id) {
         id -> Integer,
         hmac_key -> Nullable<Binary>,
+        hmac_key_cycled_at_ns -> Nullable<BigInt>,
     }
 }
 
@@ -143,12 +167,14 @@ diesel::allow_tables_to_appear_in_same_query!(
     group_intents,
     group_messages,
     groups,
+    icebox,
     identity,
     identity_cache,
     identity_updates,
     key_package_history,
     openmls_key_store,
     openmls_key_value,
+    processed_device_sync_messages,
     refresh_state,
     user_preferences,
     conversation_list

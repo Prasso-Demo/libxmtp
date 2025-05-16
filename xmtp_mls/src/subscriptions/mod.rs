@@ -1,22 +1,26 @@
 use futures::{Stream, StreamExt};
+use process_welcome::ProcessWelcomeFuture;
 use prost::Message;
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{broadcast, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::instrument;
-use xmtp_id::scw_verifier::SmartContractSignatureVerifier;
+
+use xmtp_db::XmtpDb;
 use xmtp_proto::{api_client::XmtpMlsStreams, xmtp::mls::api::v1::WelcomeMessage};
 
 use stream_all::StreamAllMessages;
-use stream_conversations::{ProcessWelcomeFuture, StreamConversations, WelcomeOrGroup};
+use stream_conversations::{ProcessWelcomeResult, StreamConversations, WelcomeOrGroup};
 
+pub mod process_message;
+pub mod process_welcome;
 mod stream_all;
 mod stream_conversations;
 pub(crate) mod stream_messages;
 
 use crate::{
     groups::{
-        device_sync::preference_sync::UserPreferenceUpdate, mls_sync::GroupMessageProcessingError,
+        device_sync::preference_sync::PreferenceUpdate, mls_sync::GroupMessageProcessingError,
         GroupError, MlsGroup,
     },
     Client, XmtpApi,
@@ -24,8 +28,10 @@ use crate::{
 use thiserror::Error;
 use xmtp_common::{retryable, RetryableError, StreamHandle};
 use xmtp_db::{
-    consent_record::StoredConsentRecord, group::ConversationType,
-    group_message::StoredGroupMessage, NotFound, StorageError,
+    consent_record::{ConsentState, StoredConsentRecord},
+    group::ConversationType,
+    group_message::StoredGroupMessage,
+    NotFound, StorageError,
 };
 
 pub(crate) type Result<T> = std::result::Result<T, SubscribeError>;
@@ -48,13 +54,18 @@ impl RetryableError for LocalEventError {
 pub enum LocalEvents {
     // a new group was created
     NewGroup(Vec<u8>),
-    SyncMessage(SyncMessage),
-    OutgoingPreferenceUpdates(Vec<UserPreferenceUpdate>),
-    IncomingPreferenceUpdate(Vec<UserPreferenceUpdate>),
+    SyncWorkerEvent(SyncWorkerEvent),
+    PreferencesChanged(Vec<PreferenceUpdate>),
 }
 
 #[derive(Debug, Clone)]
-pub enum SyncMessage {
+pub enum SyncWorkerEvent {
+    NewSyncGroupFromWelcome(Vec<u8>),
+    NewSyncGroupMsg,
+    // The sync worker will auto-sync these with other devices.
+    SyncPreferences(Vec<PreferenceUpdate>),
+
+    // TODO: Device Sync V1 below - Delete when V1 is deleted
     Request { message_id: Vec<u8> },
     Reply { message_id: Vec<u8> },
 }
@@ -73,60 +84,35 @@ impl LocalEvents {
         use LocalEvents::*;
 
         match &self {
-            SyncMessage(_) => Some(self),
-            OutgoingPreferenceUpdates(_) => Some(self),
-            IncomingPreferenceUpdate(_) => Some(self),
+            SyncWorkerEvent(_) => Some(self),
             _ => None,
         }
     }
 
     fn consent_filter(self) -> Option<Vec<StoredConsentRecord>> {
-        use LocalEvents::*;
-
         match self {
-            OutgoingPreferenceUpdates(updates) => {
+            Self::PreferencesChanged(updates) => {
                 let updates = updates
                     .into_iter()
                     .filter_map(|pu| match pu {
-                        UserPreferenceUpdate::ConsentUpdate(cr) => Some(cr),
+                        PreferenceUpdate::Consent(cr) => Some(cr),
                         _ => None,
                     })
                     .collect();
                 Some(updates)
             }
-            IncomingPreferenceUpdate(updates) => {
-                let updates = updates
-                    .into_iter()
-                    .filter_map(|pu| match pu {
-                        UserPreferenceUpdate::ConsentUpdate(cr) => Some(cr),
-                        _ => None,
-                    })
-                    .collect();
-                Some(updates)
-            }
+
             _ => None,
         }
     }
 
-    fn preference_filter(self) -> Option<Vec<UserPreferenceUpdate>> {
-        use LocalEvents::*;
-
+    fn preference_filter(self) -> Option<Vec<PreferenceUpdate>> {
         match self {
-            OutgoingPreferenceUpdates(updates) => {
+            Self::PreferencesChanged(updates) => {
                 let updates = updates
                     .into_iter()
                     .filter_map(|pu| match pu {
-                        UserPreferenceUpdate::ConsentUpdate(_) => None,
-                        _ => Some(pu),
-                    })
-                    .collect();
-                Some(updates)
-            }
-            IncomingPreferenceUpdate(updates) => {
-                let updates = updates
-                    .into_iter()
-                    .filter_map(|pu| match pu {
-                        UserPreferenceUpdate::ConsentUpdate(_) => None,
+                        PreferenceUpdate::Consent(_) => None,
                         _ => Some(pu),
                     })
                     .collect();
@@ -140,7 +126,7 @@ impl LocalEvents {
 pub(crate) trait StreamMessages {
     fn stream_sync_messages(self) -> impl Stream<Item = Result<LocalEvents>>;
     fn stream_consent_updates(self) -> impl Stream<Item = Result<Vec<StoredConsentRecord>>>;
-    fn stream_preference_updates(self) -> impl Stream<Item = Result<Vec<UserPreferenceUpdate>>>;
+    fn stream_preference_updates(self) -> impl Stream<Item = Result<Vec<PreferenceUpdate>>>;
 }
 
 impl StreamMessages for broadcast::Receiver<LocalEvents> {
@@ -163,7 +149,7 @@ impl StreamMessages for broadcast::Receiver<LocalEvents> {
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn stream_preference_updates(self) -> impl Stream<Item = Result<Vec<UserPreferenceUpdate>>> {
+    fn stream_preference_updates(self) -> impl Stream<Item = Result<Vec<PreferenceUpdate>>> {
         BroadcastStream::new(self).filter_map(|event| async {
             xmtp_common::optify!(event, "Missed message due to event queue lag")
                 .and_then(LocalEvents::preference_filter)
@@ -195,6 +181,8 @@ pub enum SubscribeError {
     ApiClient(#[from] xmtp_api::ApiError),
     #[error("{0}")]
     BoxError(Box<dyn RetryableError + Send + Sync>),
+    #[error(transparent)]
+    Db(#[from] xmtp_db::ConnectionError),
 }
 
 impl RetryableError for SubscribeError {
@@ -211,14 +199,15 @@ impl RetryableError for SubscribeError {
             ConversationStream(e) => retryable!(e),
             ApiClient(e) => retryable!(e),
             BoxError(e) => retryable!(e),
+            Db(c) => retryable!(c),
         }
     }
 }
 
-impl<ApiClient, V> Client<ApiClient, V>
+impl<ApiClient, Db> Client<ApiClient, Db>
 where
     ApiClient: XmtpApi + Send + Sync + 'static,
-    V: SmartContractSignatureVerifier + Send + Sync + 'static,
+    Db: XmtpDb + Send + Sync + 'static,
 {
     /// Async proxy for processing a streamed welcome message.
     /// Shouldn't be used unless for out-of-process utilities like Push Notifications.
@@ -227,8 +216,8 @@ where
         &self,
         envelope_bytes: Vec<u8>,
     ) -> Result<MlsGroup<Self>> {
-        let provider = self.mls_provider()?;
-        let conn = provider.conn_ref();
+        let provider = self.mls_provider();
+        let conn = provider.db();
         let envelope =
             WelcomeMessage::decode(envelope_bytes.as_slice()).map_err(SubscribeError::from)?;
         let known_welcomes = HashSet::from_iter(conn.group_welcome_ids()?.into_iter());
@@ -238,20 +227,20 @@ where
             WelcomeOrGroup::Welcome(envelope),
             None,
         )?;
-        future
-            .process()
-            .await?
-            .map(|(group, _)| group)
-            .ok_or_else(|| {
-                stream_conversations::ConversationStreamError::InvalidConversationType.into()
-            })
+        match future.process().await? {
+            ProcessWelcomeResult::New { group, .. } => Ok(group),
+            ProcessWelcomeResult::NewStored { group, .. } => Ok(group),
+            ProcessWelcomeResult::IgnoreId { .. } | ProcessWelcomeResult::Ignore => {
+                Err(stream_conversations::ConversationStreamError::InvalidConversationType.into())
+            }
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn stream_conversations(
         &self,
         conversation_type: Option<ConversationType>,
-    ) -> Result<impl Stream<Item = Result<MlsGroup<Self>>> + use<'_, ApiClient, V>>
+    ) -> Result<impl Stream<Item = Result<MlsGroup<Self>>> + use<'_, ApiClient, Db>>
     where
         ApiClient: XmtpMlsStreams,
     {
@@ -259,13 +248,13 @@ where
     }
 }
 
-impl<ApiClient, V> Client<ApiClient, V>
+impl<ApiClient, Db> Client<ApiClient, Db>
 where
     ApiClient: XmtpApi + XmtpMlsStreams + Send + Sync + 'static,
-    V: SmartContractSignatureVerifier + Send + Sync + 'static,
+    Db: XmtpDb + Send + Sync + 'static,
 {
     pub fn stream_conversations_with_callback(
-        client: Arc<Client<ApiClient, V>>,
+        client: Arc<Client<ApiClient, Db>>,
         conversation_type: Option<ConversationType>,
         #[cfg(not(target_arch = "wasm32"))] mut convo_callback: impl FnMut(Result<MlsGroup<Self>>)
             + Send
@@ -290,6 +279,7 @@ where
     pub async fn stream_all_messages(
         &self,
         conversation_type: Option<ConversationType>,
+        consent_state: Option<Vec<ConsentState>>,
     ) -> Result<impl Stream<Item = Result<StoredGroupMessage>> + '_> {
         tracing::debug!(
             inbox_id = self.inbox_id(),
@@ -298,12 +288,13 @@ where
             "stream all messages"
         );
 
-        StreamAllMessages::new(self, conversation_type).await
+        StreamAllMessages::new(self, conversation_type, consent_state).await
     }
 
     pub fn stream_all_messages_with_callback(
-        client: Arc<Client<ApiClient, V>>,
+        client: Arc<Client<ApiClient, Db>>,
         conversation_type: Option<ConversationType>,
+        consent_state: Option<Vec<ConsentState>>,
         #[cfg(not(target_arch = "wasm32"))] mut callback: impl FnMut(Result<StoredGroupMessage>)
             + Send
             + 'static,
@@ -312,9 +303,12 @@ where
         let (tx, rx) = oneshot::channel();
 
         xmtp_common::spawn(Some(rx), async move {
-            let stream = client.stream_all_messages(conversation_type).await?;
+            let stream = client
+                .stream_all_messages(conversation_type, consent_state)
+                .await?;
             futures::pin_mut!(stream);
             let _ = tx.send(());
+
             while let Some(message) = stream.next().await {
                 callback(message)
             }
@@ -324,7 +318,7 @@ where
     }
 
     pub fn stream_consent_with_callback(
-        client: Arc<Client<ApiClient, V>>,
+        client: Arc<Client<ApiClient, Db>>,
         #[cfg(not(target_arch = "wasm32"))] mut callback: impl FnMut(Result<Vec<StoredConsentRecord>>)
             + Send
             + 'static,
@@ -348,12 +342,11 @@ where
     }
 
     pub fn stream_preferences_with_callback(
-        client: Arc<Client<ApiClient, V>>,
-        #[cfg(not(target_arch = "wasm32"))] mut callback: impl FnMut(Result<Vec<UserPreferenceUpdate>>)
+        client: Arc<Client<ApiClient, Db>>,
+        #[cfg(not(target_arch = "wasm32"))] mut callback: impl FnMut(Result<Vec<PreferenceUpdate>>)
             + Send
             + 'static,
-        #[cfg(target_arch = "wasm32")] mut callback: impl FnMut(Result<Vec<UserPreferenceUpdate>>)
-            + 'static,
+        #[cfg(target_arch = "wasm32")] mut callback: impl FnMut(Result<Vec<PreferenceUpdate>>) + 'static,
     ) -> impl StreamHandle<StreamOutput = Result<()>> {
         let (tx, rx) = oneshot::channel();
 

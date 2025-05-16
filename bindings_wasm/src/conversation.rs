@@ -1,15 +1,16 @@
 use crate::client::RustXmtpClient;
-use crate::conversations::{HmacKey, MessageDisappearingSettings};
+use crate::conversations::{ConversationDebugInfo, HmacKey, MessageDisappearingSettings};
 use crate::encoded_content::EncodedContent;
 use crate::identity::{Identifier, IdentityExt};
 use crate::messages::{ListMessagesOptions, Message, MessageWithReactions};
 use crate::permissions::{MetadataField, PermissionPolicy, PermissionUpdateType};
 use crate::streams::{StreamCallback, StreamCloser};
 use crate::{consent_state::ConsentState, permissions::GroupPermissions};
+use std::collections::HashMap;
 use std::sync::Arc;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::{prelude::wasm_bindgen, JsError};
-use xmtp_db::group::ConversationType;
+use xmtp_db::group::{ConversationType, DmIdExt};
 use xmtp_db::group_message::MsgQueryArgs;
 use xmtp_mls::groups::{
   group_metadata::GroupMetadata as XmtpGroupMetadata,
@@ -96,14 +97,21 @@ impl GroupMember {
 pub struct Conversation {
   inner_client: Arc<RustXmtpClient>,
   group_id: Vec<u8>,
+  dm_id: Option<String>,
   created_at_ns: i64,
 }
 
 impl Conversation {
-  pub fn new(inner_client: Arc<RustXmtpClient>, group_id: Vec<u8>, created_at_ns: i64) -> Self {
+  pub fn new(
+    inner_client: Arc<RustXmtpClient>,
+    group_id: Vec<u8>,
+    dm_id: Option<String>,
+    created_at_ns: i64,
+  ) -> Self {
     Self {
       inner_client,
       group_id,
+      dm_id,
       created_at_ns,
     }
   }
@@ -112,6 +120,7 @@ impl Conversation {
     MlsGroup::new(
       self.inner_client.clone(),
       self.group_id.clone(),
+      self.dm_id.clone(),
       self.created_at_ns,
     )
   }
@@ -122,6 +131,7 @@ impl From<MlsGroup<RustXmtpClient>> for Conversation {
     Conversation {
       inner_client: mls_group.client,
       group_id: mls_group.group_id,
+      dm_id: mls_group.dm_id,
       created_at_ns: mls_group.created_at_ns,
     }
   }
@@ -131,10 +141,7 @@ impl From<MlsGroup<RustXmtpClient>> for Conversation {
 impl Conversation {
   #[wasm_bindgen]
   pub fn id(&self) -> String {
-    match self.inner_client.stitched_group(&self.group_id) {
-      Ok(group) => hex::encode(group.group_id.clone()),
-      Err(_) => hex::encode(self.group_id.clone()),
-    }
+    hex::encode(self.group_id.clone())
   }
 
   #[wasm_bindgen]
@@ -194,11 +201,8 @@ impl Conversation {
   ) -> Result<Vec<Message>, JsError> {
     let opts = opts.unwrap_or_default();
     let group = self.to_mls_group();
-    let provider = group
-      .mls_provider()
-      .map_err(|e| JsError::new(&format!("{e}")))?;
     let conversation_type = group
-      .conversation_type(&provider)
+      .conversation_type()
       .await
       .map_err(|e| JsError::new(&format!("{e}")))?;
     let kind = match conversation_type {
@@ -228,11 +232,8 @@ impl Conversation {
   ) -> Result<Vec<MessageWithReactions>, JsError> {
     let opts = opts.unwrap_or_default();
     let group = self.to_mls_group();
-    let provider = group
-      .mls_provider()
-      .map_err(|e| JsError::new(&format!("{e}")))?;
     let conversation_type = group
-      .conversation_type(&provider)
+      .conversation_type()
       .await
       .map_err(|e| JsError::new(&format!("{e}")))?;
     let kind = match conversation_type {
@@ -292,11 +293,7 @@ impl Conversation {
   pub fn admin_list(&self) -> Result<Vec<String>, JsError> {
     let group = self.to_mls_group();
     let admin_list = group
-      .admin_list(
-        &group
-          .mls_provider()
-          .map_err(|e| JsError::new(&format!("{e}")))?,
-      )
+      .admin_list()
       .map_err(|e| JsError::new(&format!("{e}")))?;
 
     Ok(admin_list)
@@ -306,11 +303,7 @@ impl Conversation {
   pub fn super_admin_list(&self) -> Result<Vec<String>, JsError> {
     let group = self.to_mls_group();
     let super_admin_list = group
-      .super_admin_list(
-        &group
-          .mls_provider()
-          .map_err(|e| JsError::new(&format!("{e}")))?,
-      )
+      .super_admin_list()
       .map_err(|e| JsError::new(&format!("{e}")))?;
 
     Ok(super_admin_list)
@@ -452,11 +445,7 @@ impl Conversation {
     let group = self.to_mls_group();
 
     let group_name = group
-      .group_name(
-        &group
-          .mls_provider()
-          .map_err(|e| JsError::new(&format!("{e}")))?,
-      )
+      .group_name()
       .map_err(|e| JsError::new(&format!("{e}")))?;
 
     Ok(group_name)
@@ -482,11 +471,7 @@ impl Conversation {
     let group = self.to_mls_group();
 
     let group_image_url_square = group
-      .group_image_url_square(
-        &group
-          .mls_provider()
-          .map_err(|e| JsError::new(&format!("{e}")))?,
-      )
+      .group_image_url_square()
       .map_err(|e| JsError::new(&format!("{e}")))?;
 
     Ok(group_image_url_square)
@@ -509,11 +494,7 @@ impl Conversation {
     let group = self.to_mls_group();
 
     let group_description = group
-      .group_description(
-        &group
-          .mls_provider()
-          .map_err(|e| JsError::new(&format!("{e}")))?,
-      )
+      .group_description()
       .map_err(|e| JsError::new(&format!("{e}")))?;
 
     Ok(group_description)
@@ -542,13 +523,7 @@ impl Conversation {
   pub fn is_active(&self) -> Result<bool, JsError> {
     let group = self.to_mls_group();
 
-    group
-      .is_active(
-        &group
-          .mls_provider()
-          .map_err(|e| JsError::new(&format!("{e}")))?,
-      )
-      .map_err(|e| JsError::new(&format!("{e}")))
+    group.is_active().map_err(|e| JsError::new(&format!("{e}")))
   }
 
   #[wasm_bindgen(js_name = pausedForVersion)]
@@ -556,11 +531,7 @@ impl Conversation {
     let group = self.to_mls_group();
 
     group
-      .paused_for_version(
-        &group
-          .mls_provider()
-          .map_err(|e| JsError::new(&format!("{e}")))?,
-      )
+      .paused_for_version()
       .map_err(|e| JsError::new(&format!("{e}")))
   }
 
@@ -577,11 +548,7 @@ impl Conversation {
   pub async fn group_metadata(&self) -> Result<GroupMetadata, JsError> {
     let group = self.to_mls_group();
     let metadata = group
-      .metadata(
-        &group
-          .mls_provider()
-          .map_err(|e| JsError::new(&format!("{e}")))?,
-      )
+      .metadata()
       .await
       .map_err(|e| JsError::new(&format!("{e}")))?;
 
@@ -590,11 +557,16 @@ impl Conversation {
 
   #[wasm_bindgen(js_name = dmPeerInboxId)]
   pub fn dm_peer_inbox_id(&self) -> Result<String, JsError> {
-    let group = self.to_mls_group();
+    let inbox_id = self.inner_client.inbox_id();
 
-    group
-      .dm_inbox_id()
-      .map_err(|e| JsError::new(&format!("{e}")))
+    Ok(
+      self
+        .to_mls_group()
+        .dm_id
+        .as_ref()
+        .ok_or(JsError::new("Not a DM conversation or missing DM ID"))?
+        .other_inbox_id(inbox_id),
+    )
   }
 
   #[wasm_bindgen(js_name = updatePermissionPolicy)]
@@ -668,6 +640,24 @@ impl Conversation {
   pub fn get_hmac_keys(&self) -> Result<JsValue, JsError> {
     let group = self.to_mls_group();
 
+    let dms = self
+      .inner_client
+      .clone()
+      .find_duplicate_dms_for_group(&self.group_id)
+      .map_err(|e| JsError::new(&e.to_string()))?;
+
+    let mut hmac_map: HashMap<String, Vec<HmacKey>> = HashMap::new();
+    for conversation in dms {
+      let id = hex::encode(&conversation.group_id);
+      let keys = conversation
+        .hmac_keys(-1..=1)
+        .map_err(|e| JsError::new(format!("{}", e).as_str()))?
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+      hmac_map.insert(id, keys);
+    }
+
     let keys = group
       .hmac_keys(-1..=1)
       .map_err(|e| JsError::new(&format!("{e}")))?
@@ -675,7 +665,38 @@ impl Conversation {
       .map(Into::into)
       .collect::<Vec<HmacKey>>();
 
-    Ok(crate::to_value(&keys)?)
+    hmac_map.insert(self.id(), keys);
+
+    Ok(crate::to_value(&hmac_map)?)
+  }
+
+  #[wasm_bindgen(js_name = getDebugInfo)]
+  pub async fn debug_info(&self) -> Result<JsValue, JsError> {
+    let group = self.to_mls_group();
+    let debug_info = group
+      .debug_info()
+      .await
+      .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(crate::to_value(&ConversationDebugInfo {
+      epoch: debug_info.epoch,
+      maybe_forked: debug_info.maybe_forked,
+      fork_details: debug_info.fork_details,
+    })?)
+  }
+
+  #[wasm_bindgen(js_name = findDuplicateDms)]
+  pub async fn find_duplicate_dms(&self) -> Result<Vec<Conversation>, JsError> {
+    // Await the async function first, then handle the error
+    let dms = self
+      .inner_client
+      .clone()
+      .find_duplicate_dms_for_group(&self.group_id)
+      .map_err(|e| JsError::new(&e.to_string()))?;
+
+    let conversations: Vec<Conversation> = dms.into_iter().map(Into::into).collect();
+
+    Ok(conversations)
   }
 }
 

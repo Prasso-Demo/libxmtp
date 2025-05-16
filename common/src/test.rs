@@ -1,21 +1,19 @@
 //! Common Test Utilites
+use crate::time::Expired;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use rand::{
     Rng,
     distributions::{Alphanumeric, DistString},
     seq::IteratorRandom,
 };
-use std::{future::Future, sync::OnceLock};
-
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::{future::Future, sync::OnceLock};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod traced_test;
 #[cfg(not(target_arch = "wasm32"))]
 pub use traced_test::TestWriter;
-
-use crate::time::Expired;
 
 mod logger;
 mod macros;
@@ -26,11 +24,11 @@ static REPLACE_IDS: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::n
 
 /// Replace inbox id in Contextual output with a name (i.e Alix, Bo, etc.)
 #[derive(Default)]
-pub struct InboxIdReplace {
+pub struct TestLogReplace {
     ids: HashMap<String, String>,
 }
 
-impl InboxIdReplace {
+impl TestLogReplace {
     pub fn add(&mut self, id: &str, name: &str) {
         self.ids.insert(id.to_string(), name.to_string());
         let mut ids = REPLACE_IDS.lock();
@@ -39,7 +37,7 @@ impl InboxIdReplace {
 }
 
 // remove ids for replacement from map on drop
-impl Drop for InboxIdReplace {
+impl Drop for TestLogReplace {
     fn drop(&mut self) {
         let mut ids = REPLACE_IDS.lock();
         for id in self.ids.keys() {
@@ -94,6 +92,7 @@ where
             .then(|| {
                 fmt::layer()
                     .compact()
+                    .with_ansi(true)
                     .fmt_fields({
                         format::debug_fn(move |writer, field, value| {
                             if field.name() == "message" {
@@ -159,10 +158,6 @@ pub fn rand_hexstring() -> String {
 
 pub fn rand_account_address() -> String {
     Alphanumeric.sample_string(&mut crate::rng(), 42)
-}
-
-pub fn rand_vec<const N: usize>() -> Vec<u8> {
-    crate::rand_array::<N>().to_vec()
 }
 
 pub fn rand_u64() -> u64 {
@@ -244,5 +239,26 @@ where
     .await?;
 
     assert_eq!(expected, result);
+    Ok(())
+}
+
+pub async fn wait_for_ge<F, Fut, T>(f: F, expected: T) -> Result<(), Expired>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = T>,
+    T: std::fmt::Debug + PartialEq + PartialOrd,
+{
+    crate::time::timeout(crate::time::Duration::from_secs(20), async {
+        loop {
+            let result = f().await;
+            if result >= expected {
+                return result;
+            } else {
+                crate::yield_().await;
+            }
+        }
+    })
+    .await?;
+
     Ok(())
 }

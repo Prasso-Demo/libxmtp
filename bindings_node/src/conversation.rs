@@ -1,11 +1,14 @@
-use std::{ops::Deref, sync::Arc};
+use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use napi::{
   bindgen_prelude::{Result, Uint8Array},
   threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode},
   JsFunction,
 };
-use xmtp_db::{group::ConversationType, group_message::MsgQueryArgs};
+use xmtp_db::{
+  group::{ConversationType, DmIdExt},
+  group_message::MsgQueryArgs,
+};
 use xmtp_mls::groups::{
   group_metadata::GroupMetadata as XmtpGroupMetadata,
   group_mutable_metadata::MetadataField as XmtpMetadataField,
@@ -28,6 +31,7 @@ use crate::{
 };
 use prost::Message as ProstMessage;
 
+use crate::conversations::ConversationDebugInfo;
 use napi_derive::napi;
 
 #[napi]
@@ -73,6 +77,7 @@ pub struct GroupMember {
 pub struct Conversation {
   inner_client: Arc<RustXmtpClient>,
   group_id: Vec<u8>,
+  dm_id: Option<String>,
   created_at_ns: i64,
 }
 
@@ -80,6 +85,7 @@ impl From<MlsGroup<RustXmtpClient>> for Conversation {
   fn from(mls_group: MlsGroup<RustXmtpClient>) -> Self {
     Conversation {
       group_id: mls_group.group_id,
+      dm_id: mls_group.dm_id,
       created_at_ns: mls_group.created_at_ns,
       inner_client: mls_group.client,
     }
@@ -88,30 +94,39 @@ impl From<MlsGroup<RustXmtpClient>> for Conversation {
 
 #[napi]
 impl Conversation {
-  pub fn new(inner_client: Arc<RustXmtpClient>, group_id: Vec<u8>, created_at_ns: i64) -> Self {
+  pub fn new(
+    inner_client: Arc<RustXmtpClient>,
+    group_id: Vec<u8>,
+    dm_id: Option<String>,
+    created_at_ns: i64,
+  ) -> Self {
     Self {
       inner_client,
       group_id,
+      dm_id,
       created_at_ns,
     }
   }
 
+  // Private helper method to create a new MlsGroup
+  fn create_mls_group(&self) -> MlsGroup<Arc<RustXmtpClient>> {
+    MlsGroup::new(
+      self.inner_client.clone(),
+      self.group_id.clone(),
+      self.dm_id.clone(),
+      self.created_at_ns,
+    )
+  }
+
   #[napi]
   pub fn id(&self) -> String {
-    match self.inner_client.stitched_group(&self.group_id) {
-      Ok(group) => hex::encode(group.group_id.clone()),
-      Err(_) => hex::encode(self.group_id.clone()),
-    }
+    hex::encode(self.group_id.clone())
   }
 
   #[napi]
   pub async fn send(&self, encoded_content: EncodedContent) -> Result<String> {
     let encoded_content: XmtpEncodedContent = encoded_content.into();
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     let message_id = group
       .send_message(encoded_content.encode_to_vec().as_slice())
@@ -123,11 +138,7 @@ impl Conversation {
   #[napi]
   pub fn send_optimistic(&self, encoded_content: EncodedContent) -> Result<String> {
     let encoded_content: XmtpEncodedContent = encoded_content.into();
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     let id = group
       .send_message_optimistic(encoded_content.encode_to_vec().as_slice())
@@ -138,23 +149,14 @@ impl Conversation {
 
   #[napi]
   pub async fn publish_messages(&self) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
     group.publish_messages().await.map_err(ErrorWrapper::from)?;
     Ok(())
   }
 
   #[napi]
   pub async fn sync(&self) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
-
+    let group = self.create_mls_group();
     group.sync().await.map_err(ErrorWrapper::from)?;
 
     Ok(())
@@ -163,14 +165,9 @@ impl Conversation {
   #[napi]
   pub async fn find_messages(&self, opts: Option<ListMessagesOptions>) -> Result<Vec<Message>> {
     let opts = opts.unwrap_or_default();
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
-    let provider = group.mls_provider().map_err(ErrorWrapper::from)?;
+    let group = self.create_mls_group();
     let conversation_type = group
-      .conversation_type(&provider)
+      .conversation_type()
       .await
       .map_err(ErrorWrapper::from)?;
     let kind = match conversation_type {
@@ -198,14 +195,9 @@ impl Conversation {
     opts: Option<ListMessagesOptions>,
   ) -> Result<Vec<MessageWithReactions>> {
     let opts = opts.unwrap_or_default();
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
-    let provider = group.mls_provider().map_err(ErrorWrapper::from)?;
+    let group = self.create_mls_group();
     let conversation_type = group
-      .conversation_type(&provider)
+      .conversation_type()
       .await
       .map_err(ErrorWrapper::from)?;
     let kind = match conversation_type {
@@ -233,11 +225,7 @@ impl Conversation {
     &self,
     envelope_bytes: Uint8Array,
   ) -> Result<Message> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
     let envelope_bytes: Vec<u8> = envelope_bytes.deref().to_vec();
     let message = group
       .process_streamed_group_message(envelope_bytes)
@@ -249,11 +237,7 @@ impl Conversation {
 
   #[napi]
   pub async fn list_members(&self) -> Result<Vec<GroupMember>> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     let members: Vec<GroupMember> = group
       .members()
@@ -286,30 +270,18 @@ impl Conversation {
 
   #[napi]
   pub fn admin_list(&self) -> Result<Vec<String>> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
-    let admin_list = group
-      .admin_list(&group.mls_provider().map_err(ErrorWrapper::from)?)
-      .map_err(ErrorWrapper::from)?;
+    let admin_list = group.admin_list().map_err(ErrorWrapper::from)?;
 
     Ok(admin_list)
   }
 
   #[napi]
   pub fn super_admin_list(&self) -> Result<Vec<String>> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
-    let super_admin_list = group
-      .super_admin_list(&group.mls_provider().map_err(ErrorWrapper::from)?)
-      .map_err(ErrorWrapper::from)?;
+    let super_admin_list = group.super_admin_list().map_err(ErrorWrapper::from)?;
 
     Ok(super_admin_list)
   }
@@ -328,11 +300,7 @@ impl Conversation {
 
   #[napi]
   pub async fn add_members(&self, account_identities: Vec<Identifier>) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .add_members(&account_identities.to_internal()?)
@@ -344,11 +312,7 @@ impl Conversation {
 
   #[napi]
   pub async fn add_admin(&self, inbox_id: String) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
     group
       .update_admin_list(UpdateAdminListType::Add, inbox_id)
       .await
@@ -359,11 +323,7 @@ impl Conversation {
 
   #[napi]
   pub async fn remove_admin(&self, inbox_id: String) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
     group
       .update_admin_list(UpdateAdminListType::Remove, inbox_id)
       .await
@@ -374,11 +334,7 @@ impl Conversation {
 
   #[napi]
   pub async fn add_super_admin(&self, inbox_id: String) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
     group
       .update_admin_list(UpdateAdminListType::AddSuper, inbox_id)
       .await
@@ -389,11 +345,7 @@ impl Conversation {
 
   #[napi]
   pub async fn remove_super_admin(&self, inbox_id: String) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
     group
       .update_admin_list(UpdateAdminListType::RemoveSuper, inbox_id)
       .await
@@ -404,11 +356,7 @@ impl Conversation {
 
   #[napi]
   pub fn group_permissions(&self) -> Result<GroupPermissions> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     let permissions = group.permissions().map_err(ErrorWrapper::from)?;
 
@@ -417,11 +365,7 @@ impl Conversation {
 
   #[napi]
   pub async fn add_members_by_inbox_id(&self, inbox_ids: Vec<String>) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .add_members_by_inbox_id(&inbox_ids)
@@ -433,11 +377,7 @@ impl Conversation {
 
   #[napi]
   pub async fn remove_members(&self, account_identities: Vec<Identifier>) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .remove_members(&account_identities.to_internal()?)
@@ -449,11 +389,7 @@ impl Conversation {
 
   #[napi]
   pub async fn remove_members_by_inbox_id(&self, inbox_ids: Vec<String>) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .remove_members_by_inbox_id(
@@ -471,11 +407,7 @@ impl Conversation {
 
   #[napi]
   pub async fn update_group_name(&self, group_name: String) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .update_group_name(group_name)
@@ -487,26 +419,16 @@ impl Conversation {
 
   #[napi]
   pub fn group_name(&self) -> Result<String> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
-    let group_name = group
-      .group_name(&group.mls_provider().map_err(ErrorWrapper::from)?)
-      .map_err(ErrorWrapper::from)?;
+    let group_name = group.group_name().map_err(ErrorWrapper::from)?;
 
     Ok(group_name)
   }
 
   #[napi]
   pub async fn update_group_image_url_square(&self, group_image_url_square: String) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .update_group_image_url_square(group_image_url_square)
@@ -518,26 +440,16 @@ impl Conversation {
 
   #[napi]
   pub fn group_image_url_square(&self) -> Result<String> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
-    let group_image_url_square = group
-      .group_image_url_square(&group.mls_provider().map_err(ErrorWrapper::from)?)
-      .map_err(ErrorWrapper::from)?;
+    let group_image_url_square = group.group_image_url_square().map_err(ErrorWrapper::from)?;
 
     Ok(group_image_url_square)
   }
 
   #[napi]
   pub async fn update_group_description(&self, group_description: String) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .update_group_description(group_description)
@@ -549,15 +461,9 @@ impl Conversation {
 
   #[napi]
   pub fn group_description(&self) -> Result<String> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
-    let group_description = group
-      .group_description(&group.mls_provider().map_err(ErrorWrapper::from)?)
-      .map_err(ErrorWrapper::from)?;
+    let group_description = group.group_description().map_err(ErrorWrapper::from)?;
 
     Ok(group_description)
   }
@@ -590,68 +496,37 @@ impl Conversation {
 
   #[napi]
   pub fn is_active(&self) -> Result<bool> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
-    Ok(
-      group
-        .is_active(&group.mls_provider().map_err(ErrorWrapper::from)?)
-        .map_err(ErrorWrapper::from)?,
-    )
+    Ok(group.is_active().map_err(ErrorWrapper::from)?)
   }
 
   #[napi]
   pub fn paused_for_version(&self) -> napi::Result<Option<String>> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
-    Ok(
-      group
-        .paused_for_version(&group.mls_provider().map_err(ErrorWrapper::from)?)
-        .map_err(ErrorWrapper::from)?,
-    )
+    Ok(group.paused_for_version().map_err(ErrorWrapper::from)?)
   }
 
   #[napi]
   pub fn added_by_inbox_id(&self) -> Result<String> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     Ok(group.added_by_inbox_id().map_err(ErrorWrapper::from)?)
   }
 
   #[napi]
   pub async fn group_metadata(&self) -> Result<GroupMetadata> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
-    let metadata = group
-      .metadata(&group.mls_provider().map_err(ErrorWrapper::from)?)
-      .await
-      .map_err(ErrorWrapper::from)?;
+    let metadata = group.metadata().await.map_err(ErrorWrapper::from)?;
 
     Ok(GroupMetadata { inner: metadata })
   }
 
   #[napi]
   pub fn consent_state(&self) -> Result<ConsentState> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     let state = group.consent_state().map_err(ErrorWrapper::from)?;
 
@@ -660,11 +535,7 @@ impl Conversation {
 
   #[napi]
   pub fn update_consent_state(&self, state: ConsentState) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .update_consent_state(state.into())
@@ -675,13 +546,12 @@ impl Conversation {
 
   #[napi]
   pub fn dm_peer_inbox_id(&self) -> Result<String> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
-
-    Ok(group.dm_inbox_id().map_err(ErrorWrapper::from)?)
+    let inbox_id = self.inner_client.inbox_id();
+    let binding = self.create_mls_group();
+    let dm_id = binding.dm_id.as_ref().ok_or(napi::Error::from_reason(
+      "Not a DM conversation or missing DM ID",
+    ))?;
+    Ok(dm_id.other_inbox_id(inbox_id))
   }
 
   #[napi]
@@ -691,11 +561,7 @@ impl Conversation {
     permission_policy_option: PermissionPolicy,
     metadata_field: Option<MetadataField>,
   ) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .update_permission_policy(
@@ -716,11 +582,7 @@ impl Conversation {
     &self,
     settings: MessageDisappearingSettings,
   ) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
     group
       .update_conversation_message_disappearing_settings(settings.into())
       .await
@@ -731,11 +593,7 @@ impl Conversation {
 
   #[napi]
   pub async fn remove_message_disappearing_settings(&self) -> Result<()> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+    let group = self.create_mls_group();
 
     group
       .remove_conversation_message_disappearing_settings()
@@ -768,16 +626,61 @@ impl Conversation {
   }
 
   #[napi]
-  pub fn get_hmac_keys(&self) -> Result<Vec<HmacKey>> {
-    let group = MlsGroup::new(
-      self.inner_client.clone(),
-      self.group_id.clone(),
-      self.created_at_ns,
-    );
+  pub fn get_hmac_keys(&self) -> Result<HashMap<String, Vec<HmacKey>>> {
+    let group = self.create_mls_group();
+
+    let dms = self
+      .inner_client
+      .clone()
+      .find_duplicate_dms_for_group(&self.group_id)
+      .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    let mut hmac_map = HashMap::new();
+    for conversation in dms {
+      let id = hex::encode(&conversation.group_id);
+      let keys = conversation
+        .hmac_keys(-1..=1)
+        .map_err(ErrorWrapper::from)?
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+      hmac_map.insert(id, keys);
+    }
+
+    let keys = group
+      .hmac_keys(-1..=1)
+      .map_err(ErrorWrapper::from)?
+      .into_iter()
+      .map(Into::into)
+      .collect::<Vec<_>>();
+
+    hmac_map.insert(self.id(), keys);
+
+    Ok(hmac_map)
+  }
+
+  #[napi]
+  pub async fn debug_info(&self) -> Result<ConversationDebugInfo> {
+    let group = self.create_mls_group();
 
     group
-      .hmac_keys(-1..=1)
-      .map(|keys| keys.into_iter().map(Into::into).collect())
+      .debug_info()
+      .await
+      .map(Into::into)
       .map_err(|e| napi::Error::from_reason(e.to_string()))
+  }
+
+  #[napi]
+  pub async fn find_duplicate_dms(&self) -> Result<Vec<Conversation>> {
+    // Await the async call and handle errors
+    let dms = self
+      .inner_client
+      .clone()
+      .find_duplicate_dms_for_group(&self.group_id)
+      .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    let conversations: Vec<Conversation> = dms.into_iter().map(Into::into).collect();
+
+    Ok(conversations)
   }
 }

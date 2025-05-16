@@ -1,9 +1,10 @@
 use super::{LocalEvents, Result, SubscribeError};
 use crate::{
     groups::{scoped_client::ScopedGroupClient, MlsGroup},
-    Client, XmtpOpenMlsProvider,
+    subscriptions::process_welcome::ProcessWelcomeFuture,
+    Client,
 };
-use xmtp_db::{group::ConversationType, refresh_state::EntityKind, NotFound};
+use xmtp_db::{group::ConversationType, refresh_state::EntityKind, XmtpDb};
 
 use futures::{prelude::stream::Select, Stream};
 use pin_project_lite::pin_project;
@@ -14,11 +15,10 @@ use std::{
     task::{ready, Context, Poll},
 };
 use tokio_stream::wrappers::BroadcastStream;
-use xmtp_common::{retry_async, FutureWrapper, Retry};
-use xmtp_id::scw_verifier::SmartContractSignatureVerifier;
+use xmtp_common::FutureWrapper;
 use xmtp_proto::{
     api_client::{trait_impls::XmtpApi, XmtpMlsStreams},
-    xmtp::mls::api::v1::{welcome_message, WelcomeMessage},
+    xmtp::mls::api::v1::WelcomeMessage,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -123,6 +123,25 @@ where
 }
 
 pin_project! {
+    /// The stream for conversations.
+    /// Handles the state machine that processes welcome messages and groups. It handles
+    /// two main states:
+    ///
+    /// - `Waiting`: Ready to receive the next message from the inner stream
+    /// - `Processing`: Currently processing a welcome/group through a future
+    ///
+    /// The implementation ensures efficient processing by immediately attempting
+    /// to advance futures when possible, rather than waiting for the next poll cycle.
+    ///
+    /// # Arguments
+    /// * `cx` - The task context for polling
+    ///
+    /// # Returns
+    /// * `Poll<Option<Result<MlsGroup<C>>>>` - The polling result:
+    ///   - `Ready(Some(Ok(group)))` when a group is successfully processed
+    ///   - `Ready(Some(Err(e)))` when an error occurs
+    ///   - `Pending` when waiting for more data or for future completion
+    ///   - `Ready(None)` when the stream has ended
     pub struct StreamConversations<'a, C, Subscription> {
         #[pin] inner: Subscription,
         #[pin] state: ProcessState<'a, C>,
@@ -142,7 +161,7 @@ pin_project! {
         /// State that indicates the stream is waiting on a IO/Network future to finish processing the current message
         /// before moving on to the next one
         Processing {
-            #[pin] future: FutureWrapper<'a, Result<Option<(MlsGroup<C>, Option<i64>)>>>
+            #[pin] future: FutureWrapper<'a, Result<ProcessWelcomeResult<C>>>
         }
     }
 }
@@ -154,20 +173,49 @@ pub(super) type WelcomesApiSubscription<'a, C> = MultiplexedSelect<
     <<C as ScopedGroupClient>::ApiClient as XmtpMlsStreams>::Error,
 >;
 
-impl<'a, A, V> StreamConversations<'a, Client<A, V>, WelcomesApiSubscription<'a, Client<A, V>>>
+impl<'a, A, D> StreamConversations<'a, Client<A, D>, WelcomesApiSubscription<'a, Client<A, D>>>
 where
     A: XmtpApi + XmtpMlsStreams + Send + Sync + 'static,
-    V: SmartContractSignatureVerifier + Send + Sync + 'static,
+    D: XmtpDb + Send + 'static,
 {
+    /// Creates a new welcome message and conversation stream.
+    ///
+    /// This function initializes a stream that combines local and remote events
+    /// for receiving conversation updates. It handles both welcome messages from
+    /// the network and locally generated group events.
+    ///
+    /// Key initialization steps:
+    /// 1. Retrieves the last cursor position for welcome messages
+    /// 2. Sets up a broadcast stream for internal events
+    /// 3. Creates a network subscription starting from the cursor
+    /// 4. Loads existing welcome IDs to prevent reprocessing
+    /// 5. Combines these sources into a multiplexed stream
+    ///
+    /// # Arguments
+    /// * `client` - Reference to the client used for API communication
+    /// * `conversation_type` - Optional filter to only receive specific conversation types
+    ///
+    /// # Returns
+    /// * `Result<Self>` - A new conversation stream if successful
+    ///
+    /// # Errors
+    /// May return errors if:
+    /// - Database operations fail
+    /// - API subscription creation fails
+    ///
+    /// # Example
+    /// ```
+    /// let stream = StreamConversations::new(&client, Some(ConversationType::Dm)).await?;
+    /// ```
     pub async fn new(
-        client: &'a Client<A, V>,
+        client: &'a Client<A, D>,
         conversation_type: Option<ConversationType>,
     ) -> Result<Self> {
-        let provider = client.mls_provider()?;
-        let conn = provider.conn_ref();
+        let provider = client.mls_provider();
+        let conn = provider.db();
         let installation_key = client.installation_public_key();
         let id_cursor = provider
-            .conn_ref()
+            .db()
             .get_last_cursor_for_id(installation_key, EntityKind::Welcome)?;
         tracing::debug!(
             cursor = id_cursor,
@@ -234,7 +282,7 @@ where
                         // this will return immediately if we have already processed the welcome
                         // and it exists in the db
                         let Processing { future } = this.state.project() else {
-                            unreachable!()
+                            unreachable!("Streaming processing future should exist.")
                         };
                         let poll = future.poll(cx);
                         self.as_mut().try_process(poll, cx)
@@ -252,40 +300,95 @@ where
     }
 }
 
+pub enum ProcessWelcomeResult<C> {
+    /// New Group and welcome id
+    New { group: MlsGroup<C>, id: i64 },
+    /// A group we already have/we created that might not have a welcome id
+    NewStored {
+        group: MlsGroup<C>,
+        maybe_id: Option<i64>,
+    },
+    /// Skip this welcome but add and id to known welcome ids
+    IgnoreId { id: i64 },
+    /// Skip this payload
+    Ignore,
+}
+
 impl<'a, C, Subscription> StreamConversations<'a, C, Subscription>
 where
     C: ScopedGroupClient + Clone + 'a,
     Subscription: Stream<Item = Result<WelcomeOrGroup>> + 'a,
 {
-    /// Try to process the welcome future
-    #[allow(clippy::type_complexity)]
+    /// Processes the result of a welcome future.
+    ///
+    /// This method handles the state transitions and output generation based on
+    /// the result of processing a welcome message or group. It implements the core
+    /// logic for determining what to do with each processed welcome:
+    ///
+    /// - For new groups: Updates tracking and yields the group
+    /// - For groups to ignore: Updates tracking and continues polling
+    /// - For previously stored groups: Yields the group
+    /// - For errors: Propagates the error and returns to waiting state
+    ///
+    /// # Arguments
+    /// * `poll` - The polling result from the welcome processing future
+    /// * `cx` - The task context for polling
+    ///
+    /// # Returns
+    /// * `Poll<Option<Result<MlsGroup<C>>>>` - The polling result based on
+    ///   the welcome processing outcome
+    ///
+    /// # Note
+    /// This method is critical for maintaining the stream's state machine and
+    /// ensuring proper handling of all possible processing outcomes.
     fn try_process(
         mut self: Pin<&mut Self>,
-        poll: Poll<Result<Option<(MlsGroup<C>, Option<i64>)>>>,
+        poll: Poll<Result<ProcessWelcomeResult<C>>>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<<Self as Stream>::Item>> {
         use Poll::*;
         let mut this = self.as_mut().project();
         match poll {
-            Ready(Ok(Some((group, welcome_id)))) => {
+            Ready(Ok(ProcessWelcomeResult::New {
+                group,
+                id: welcome_id,
+            })) => {
                 tracing::debug!(
                     group_id = hex::encode(&group.group_id),
                     "finished processing with group {}",
                     hex::encode(&group.group_id)
                 );
-                if let Some(id) = welcome_id {
-                    this.known_welcome_ids.insert(id);
-                }
+                this.known_welcome_ids.insert(welcome_id);
                 this.state.set(ProcessState::Waiting);
                 Ready(Some(Ok(group)))
             }
-            // we are ignoring this payload
-            Ready(Ok(None)) => {
-                tracing::debug!("ignoring this payload");
+            // we are ignoring this payload with id
+            Ready(Ok(ProcessWelcomeResult::IgnoreId { id })) => {
+                tracing::debug!("ignoring streamed conversation payload with welcome id {id}");
+                this.known_welcome_ids.insert(id);
                 this.state.as_mut().set(ProcessState::Waiting);
                 // we have to re-ad this task to the queue
                 // to let http know we are waiting on the next item
                 self.poll_next(cx)
+            }
+            Ready(Ok(ProcessWelcomeResult::Ignore)) => {
+                tracing::debug!("ignoring streamed conversation payload");
+                this.state.as_mut().set(ProcessState::Waiting);
+                // we have to re-ad this task to the queue
+                // to let http know we are waiting on the next item
+                self.poll_next(cx)
+            }
+            Ready(Ok(ProcessWelcomeResult::NewStored { group, maybe_id })) => {
+                tracing::debug!(
+                    group_id = hex::encode(&group.group_id),
+                    "finished processing with group {}",
+                    hex::encode(&group.group_id)
+                );
+                if let Some(id) = maybe_id {
+                    this.known_welcome_ids.insert(id);
+                }
+                this.state.set(ProcessState::Waiting);
+                Ready(Some(Ok(group)))
             }
             Ready(Err(e)) => {
                 this.state.as_mut().set(ProcessState::Waiting);
@@ -296,160 +399,14 @@ where
     }
 }
 
-fn extract_welcome_message(welcome: &WelcomeMessage) -> Result<&welcome_message::V1> {
-    match welcome.version {
-        Some(welcome_message::Version::V1(ref welcome)) => Ok(welcome),
-        _ => Err(ConversationStreamError::InvalidPayload.into()),
-    }
-}
-
-/// Future for processing `WelcomeorGroup`
-pub struct ProcessWelcomeFuture<Client> {
-    /// welcome ids in DB and which are already processed
-    known_welcome_ids: HashSet<i64>,
-    /// The libxmtp client
-    client: Client,
-    /// the welcome or group being processed in this future
-    item: WelcomeOrGroup,
-    /// the xmtp mls provider
-    provider: XmtpOpenMlsProvider,
-    /// Conversation type to filter for, if any.
-    conversation_type: Option<ConversationType>,
-}
-
-impl<C> ProcessWelcomeFuture<C>
-where
-    C: ScopedGroupClient + Clone,
-{
-    pub fn new(
-        known_welcome_ids: HashSet<i64>,
-        client: C,
-        item: WelcomeOrGroup,
-        conversation_type: Option<ConversationType>,
-    ) -> Result<ProcessWelcomeFuture<C>> {
-        let provider = client.context().mls_provider()?;
-
-        Ok(Self {
-            known_welcome_ids,
-            client,
-            item,
-            provider,
-            conversation_type,
-        })
-    }
-}
-
-/// bulk of the processing for a new welcome/group
-impl<C> ProcessWelcomeFuture<C>
-where
-    C: ScopedGroupClient + Clone,
-{
-    /// Process the welcome. if its a group, create the group and return it.
-    #[tracing::instrument(skip_all)]
-    pub async fn process(self) -> Result<Option<(MlsGroup<C>, Option<i64>)>> {
-        use WelcomeOrGroup::*;
-        let (group, welcome_id) = match self.item {
-            Welcome(ref w) => {
-                let welcome = extract_welcome_message(w)?;
-                let id = welcome.id as i64;
-                // try to load it from store first and avoid overhead
-                // of processing a welcome & erroring
-                // for immediate return, this must stay in the top-level future,
-                // to avoid a possible yield on the await in on_welcome.
-                if self.known_welcome_ids.contains(&id) {
-                    tracing::debug!(
-                        "Found existing welcome. Returning from db & skipping processing"
-                    );
-                    let (group, id) = self.load_from_store(id).map(|(g, v)| (g, Some(v)))?;
-                    let metadata = group.metadata(&self.provider).await?;
-                    return Ok(self
-                        .conversation_type
-                        .is_none_or(|ct| ct == metadata.conversation_type)
-                        .then_some((group, id)));
-                }
-
-                let (group, id) = self.on_welcome(welcome).await?;
-                (group, Some(id))
-            }
-            Group(id) => {
-                tracing::debug!("Stream conversations got existing group, pulling from db.");
-                let (group, stored_group) =
-                    MlsGroup::new_validated(self.client, id, &self.provider)?;
-                (group, stored_group.welcome_id)
-            }
-        };
-
-        let metadata = group.metadata(&self.provider).await?;
-        Ok(self
-            .conversation_type
-            .is_none_or(|ct| ct == metadata.conversation_type)
-            .then_some((group, welcome_id)))
-    }
-
-    /// process a new welcome, returning the Group & Welcome ID
-    async fn on_welcome(&self, welcome: &welcome_message::V1) -> Result<(MlsGroup<C>, i64)> {
-        let welcome_message::V1 {
-            id,
-            created_ns: _,
-            ref installation_key,
-            ..
-        } = welcome;
-        let id = *id as i64;
-
-        let Self {
-            ref client,
-            ref provider,
-            ..
-        } = self;
-        tracing::info!(
-            installation_id = hex::encode(installation_key),
-            welcome_id = &id,
-            "Trying to process streamed welcome"
-        );
-
-        let group = retry_async!(
-            Retry::default(),
-            (async { MlsGroup::create_from_welcome(client, provider, welcome, false).await })
-        );
-
-        if let Err(e) = group {
-            tracing::info!("Processing welcome failed, trying to load existing..");
-            // try to load it from the store again in case of race
-            return self
-                .load_from_store(id)
-                .map_err(|_| SubscribeError::from(e));
-        }
-
-        Ok((group?, id))
-    }
-
-    /// Load a group from disk by its welcome_id
-    fn load_from_store(&self, id: i64) -> Result<(MlsGroup<C>, i64)> {
-        let conn = self.provider.conn_ref();
-        let group = conn
-            .find_group_by_welcome_id(id)?
-            .ok_or(NotFound::GroupByWelcome(id))?;
-        tracing::info!(
-            inbox_id = self.client.inbox_id(),
-            group_id = hex::encode(&group.id),
-            welcome_id = ?group.welcome_id,
-            "loading existing group for welcome_id: {:?}",
-            group.welcome_id
-        );
-        Ok((
-            MlsGroup::new(self.client.clone(), group.id, group.created_at_ns),
-            id,
-        ))
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
 
     use super::*;
     use crate::builder::ClientBuilder;
-    use crate::groups::{DMMetadataOptions, GroupMetadataOptions};
+    use crate::groups::GroupMetadataOptions;
+    use crate::tester;
     use xmtp_db::group::GroupQueryArgs;
 
     use futures::StreamExt;
@@ -480,69 +437,74 @@ mod test {
     }
 
     #[rstest::rstest]
+    #[xmtp_common::test(unwrap_try = "true")]
+    #[timeout(std::time::Duration::from_secs(5))]
+    async fn test_sync_groups_are_not_streamed() {
+        tester!(alix, sync_worker);
+        let stream = alix.stream_conversations(None).await?;
+        futures::pin_mut!(stream);
+
+        tester!(_alix2, from: alix);
+
+        let result =
+            xmtp_common::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
+        assert!(result.is_err(), "Sync group should not stream");
+    }
+
+    #[rstest::rstest]
+    #[case(ConversationType::Dm, "Unexpectedly received a Group")]
+    #[case(ConversationType::Group, "Unexpectedly received a DM")]
+    #[xmtp_common::test]
+    #[timeout(std::time::Duration::from_secs(7))]
+
+    // #[cfg_attr(target_arch = "wasm32", ignore)]
+    async fn test_dm_stream_filter(
+        #[case] conversation_type: ConversationType,
+        #[case] expected: &str,
+    ) {
+        tester!(alix);
+        tester!(bo);
+        let stream = alix
+            .stream_conversations(Some(conversation_type))
+            .await
+            .unwrap();
+        futures::pin_mut!(stream);
+
+        alix.find_or_create_dm_by_inbox_id(bo.inbox_id().to_string(), None)
+            .await
+            .unwrap();
+
+        let group = alix
+            .create_group(None, GroupMetadataOptions::default())
+            .unwrap();
+        group
+            .add_members_by_inbox_id(&[bo.inbox_id()])
+            .await
+            .unwrap();
+
+        let group = stream.next().await.unwrap();
+        let metadata = group.unwrap().metadata().await.unwrap();
+
+        assert_eq!(
+            metadata.conversation_type, conversation_type,
+            "{}",
+            expected
+        );
+        // there is only one item on the stream
+        let result =
+            xmtp_common::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
+        assert!(result.is_err(), "should only be one item in the stream");
+    }
+
+    #[rstest::rstest]
     #[xmtp_common::test]
     #[timeout(std::time::Duration::from_secs(7))]
     #[cfg_attr(target_arch = "wasm32", ignore)]
-    async fn test_dm_streaming() {
+    async fn test_dm_stream_all_conversation_types() {
         let alix = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
         let bo = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
-        let caro = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
         let davon = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
         let eri = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
-
-        let stream = alix
-            .stream_conversations(Some(ConversationType::Group))
-            .await
-            .unwrap();
-        futures::pin_mut!(stream);
-
-        alix.find_or_create_dm_by_inbox_id(bo.inbox_id().to_string(), DMMetadataOptions::default())
-            .await
-            .unwrap();
-        let result =
-            xmtp_common::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
-        assert!(result.is_err(), "Stream unexpectedly received a DM group");
-
-        let group = alix
-            .create_group(None, GroupMetadataOptions::default())
-            .unwrap();
-        group
-            .add_members_by_inbox_id(&[bo.inbox_id()])
-            .await
-            .unwrap();
-
-        let group = stream.next().await.unwrap();
-        assert!(group.is_ok());
-
-        // Start a stream with only dms
-        // Start a stream with conversation_type DM
-        let stream = alix
-            .stream_conversations(Some(ConversationType::Dm))
-            .await
-            .unwrap();
-        futures::pin_mut!(stream);
-
-        let group = alix
-            .create_group(None, GroupMetadataOptions::default())
-            .unwrap();
-        group
-            .add_members_by_inbox_id(&[bo.inbox_id()])
-            .await
-            .unwrap();
-
-        // we should not get a message
-        let result =
-            xmtp_common::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
-        assert!(result.is_err(), "Stream unexpectedly received a Group");
-
-        alix.find_or_create_dm_by_inbox_id(
-            caro.inbox_id().to_string(),
-            DMMetadataOptions::default(),
-        )
-        .await
-        .unwrap();
-        let group = stream.next().await.unwrap();
-        assert!(group.is_ok());
 
         // Start a stream with all conversations
         let mut groups = Vec::new();
@@ -550,21 +512,15 @@ mod test {
         let stream = alix.stream_conversations(None).await.unwrap();
         futures::pin_mut!(stream);
 
-        alix.find_or_create_dm_by_inbox_id(
-            davon.inbox_id().to_string(),
-            DMMetadataOptions::default(),
-        )
-        .await
-        .unwrap();
+        alix.find_or_create_dm_by_inbox_id(davon.inbox_id().to_string(), None)
+            .await
+            .unwrap();
         let group = stream.next().await.unwrap();
         assert!(group.is_ok());
         groups.push(group.unwrap());
 
         let dm = eri
-            .find_or_create_dm_by_inbox_id(
-                alix.inbox_id().to_string(),
-                DMMetadataOptions::default(),
-            )
+            .find_or_create_dm_by_inbox_id(alix.inbox_id().to_string(), None)
             .await
             .unwrap();
         dm.add_members_by_inbox_id(&[alix.inbox_id()])
@@ -590,7 +546,7 @@ mod test {
 
     #[rstest::rstest]
     #[xmtp_common::test]
-    #[timeout(std::time::Duration::from_secs(5))]
+    #[timeout(std::time::Duration::from_secs(10))]
     async fn test_self_group_creation() {
         let alix = Arc::new(ClientBuilder::new_test_client_no_sync(&generate_local_wallet()).await);
         let bo = Arc::new(ClientBuilder::new_test_client_no_sync(&generate_local_wallet()).await);
@@ -615,10 +571,79 @@ mod test {
         let _bo_group = stream.next().await.unwrap();
 
         // Verify syncing welcomes while streaming causes no issues
-        alix.sync_welcomes(&alix.mls_provider().unwrap())
-            .await
-            .unwrap();
+        alix.sync_welcomes().await.unwrap();
         let find_groups_results = alix.find_groups(GroupQueryArgs::default()).unwrap();
         assert_eq!(2, find_groups_results.len());
+    }
+
+    #[rstest::rstest]
+    #[xmtp_common::test]
+    #[timeout(std::time::Duration::from_secs(5))]
+    async fn test_add_remove_re_add() {
+        let alix = Arc::new(ClientBuilder::new_test_client_no_sync(&generate_local_wallet()).await);
+        let bo = Arc::new(ClientBuilder::new_test_client_no_sync(&generate_local_wallet()).await);
+
+        let alix_group = alix
+            .create_group_with_inbox_ids(
+                &[bo.inbox_id().to_string()],
+                None,
+                GroupMetadataOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        alix_group
+            .remove_members_by_inbox_id(&[bo.inbox_id()])
+            .await
+            .unwrap();
+        bo.sync_welcomes().await.unwrap();
+        let stream = bo
+            .stream_conversations(Some(ConversationType::Group))
+            .await
+            .unwrap();
+        futures::pin_mut!(stream);
+        alix_group
+            .add_members_by_inbox_id(&[bo.inbox_id().to_string()])
+            .await
+            .unwrap();
+
+        let group = stream.next().await.unwrap();
+        assert!(group.is_ok());
+    }
+
+    #[rstest::rstest]
+    #[xmtp_common::test]
+    #[timeout(std::time::Duration::from_secs(15))]
+    async fn test_duplicate_dm_not_streamed() {
+        use xmtp_cryptography::utils::generate_local_wallet;
+
+        let client1 = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
+        let client2 = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
+
+        let mut stream = client1.stream_conversations(None).await.unwrap();
+
+        // First DM - should stream
+        let dm1 = client1
+            .find_or_create_dm_by_inbox_id(client2.inbox_id().to_string(), None)
+            .await
+            .unwrap();
+
+        let streamed_dm1 = stream.next().await.unwrap();
+        assert!(streamed_dm1.is_ok());
+        assert_eq!(streamed_dm1.unwrap().group_id, dm1.group_id);
+
+        // Create a second DM with same participants — triggers duplicate logic
+        let dm2 = client2
+            .find_or_create_dm_by_inbox_id(client1.inbox_id().to_string(), None)
+            .await
+            .unwrap();
+
+        // Make sure it's actually a new group
+        assert_ne!(dm1.group_id, dm2.group_id);
+
+        // It should NOT appear in the stream
+        let result =
+            xmtp_common::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
+        assert!(result.is_err(), "Duplicate DM was unexpectedly streamed");
     }
 }

@@ -13,11 +13,18 @@ pub use xmtp_openmls_provider::*;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+#[cfg(any(test, feature = "test-utils"))]
+pub use test_utils::*;
 
+pub use diesel;
 use diesel::connection::SimpleConnection;
 pub use encrypted_store::*;
 pub use errors::*;
-impl DbConnection {
+
+/// The default platform-specific store
+pub type DefaultStore = EncryptedMessageStore<database::DefaultDatabase>;
+
+impl<C: ConnectionExt> DbConnection<C> {
     #[allow(unused)]
     pub(crate) fn enable_readonly(&self) -> Result<(), StorageError> {
         self.raw_query_write(|conn| conn.batch_execute("PRAGMA query_only = ON;"))?;
@@ -37,9 +44,16 @@ pub async fn init_sqlite() {}
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_util {
     #![allow(clippy::unwrap_used)]
+
+    #[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn _setup() {
+        xmtp_common::logger();
+    }
+
     use super::*;
     use diesel::{RunQueryDsl, connection::LoadConnection, deserialize::FromSqlRow, sql_query};
-    impl DbConnection {
+    impl<C: ConnectionExt> DbConnection<C> {
         /// Create a new table and register triggers for tracking column updates
         pub fn register_triggers(&self) {
             tracing::info!("Registering triggers");
@@ -49,6 +63,7 @@ pub mod test_util {
                     intents_created INT DEFAULT 0,
                     intents_published INT DEFAULT 0,
                     intents_deleted INT DEFAULT 0,
+                    intents_processed INT DEFAULT 0,
                     rowid integer PRIMARY KEY CHECK (rowid = 1) -- There can only be one meta
                 );
                 "#,
@@ -62,6 +77,12 @@ pub mod test_util {
                 BEGIN
                     UPDATE test_metadata SET intents_published = intents_published + 1;
                 END;"#,
+                r#"CREATE TRIGGER intents_processed_tracking AFTER UPDATE OF state ON group_intents
+                FOR EACH ROW
+                WHEN NEW.state = 5
+                BEGIN
+                    UPDATE test_metadata SET intents_processed = intents_processed + 1;
+                END;"#,
                 r#"CREATE TRIGGER intents_deleted_tracking AFTER DELETE ON group_intents
                 FOR EACH ROW
                 BEGIN
@@ -70,8 +91,9 @@ pub mod test_util {
                 r#"INSERT INTO test_metadata (
                     intents_created,
                     intents_deleted,
-                    intents_published
-                ) VALUES (0, 0,0);"#,
+                    intents_published,
+                    intents_processed
+                ) VALUES (0, 0, 0, 0);"#,
             ];
 
             for query in queries {
@@ -96,7 +118,23 @@ pub mod test_util {
                     ))
                     .unwrap();
                 let row = row.next().unwrap().unwrap();
-                Ok::<_, StorageError>(
+                Ok(
+                    <i32 as FromSqlRow<diesel::sql_types::Integer, _>>::build_from_row(&row)
+                        .unwrap(),
+                )
+            })
+            .unwrap()
+        }
+
+        pub fn intents_processed(&self) -> i32 {
+            self.raw_query_read(|conn| {
+                let mut row = conn
+                    .load(sql_query(
+                        "SELECT intents_processed FROM test_metadata WHERE rowid = 1",
+                    ))
+                    .unwrap();
+                let row = row.next().unwrap().unwrap();
+                Ok(
                     <i32 as FromSqlRow<diesel::sql_types::Integer, _>>::build_from_row(&row)
                         .unwrap(),
                 )
@@ -110,7 +148,7 @@ pub mod test_util {
                     .load(sql_query("SELECT intents_deleted FROM test_metadata"))
                     .unwrap();
                 let row = row.next().unwrap().unwrap();
-                Ok::<_, StorageError>(
+                Ok(
                     <i32 as FromSqlRow<diesel::sql_types::Integer, _>>::build_from_row(&row)
                         .unwrap(),
                 )
@@ -124,7 +162,7 @@ pub mod test_util {
                     .load(sql_query("SELECT intents_created FROM test_metadata"))
                     .unwrap();
                 let row = row.next().unwrap().unwrap();
-                Ok::<_, StorageError>(
+                Ok(
                     <i32 as FromSqlRow<diesel::sql_types::Integer, _>>::build_from_row(&row)
                         .unwrap(),
                 )
