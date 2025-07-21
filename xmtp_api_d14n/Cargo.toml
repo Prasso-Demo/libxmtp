@@ -4,6 +4,9 @@ edition = "2024"
 license.workspace = true
 version.workspace = true
 
+[lints.clippy]
+uninlined_format_args = "allow"
+
 [dependencies]
 async-trait.workspace = true
 ctor.workspace = true
@@ -33,10 +36,10 @@ openmls = { workspace = true }
 openmls = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
-xmtp_proto = { workspace = true, features = ["convert", "test-utils"] }
-xmtp_common = { workspace = true, features = ["test-utils"] }
-wasm-bindgen-test.workspace = true
 hex.workspace = true
+wasm-bindgen-test.workspace = true
+xmtp_common = { workspace = true, features = ["test-utils"] }
+xmtp_proto = { workspace = true, features = ["convert", "test-utils"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio.workspace = true

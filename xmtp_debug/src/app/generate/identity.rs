@@ -47,6 +47,7 @@ impl GenerateIdentity {
             let first = identities.next().ok_or(eyre::eyre!("Does not exist"))??;
 
             let state = client
+                .identity_updates()
                 .get_latest_association_state(&connection, &hex::encode(first.inbox_id))
                 .await?;
             info!("Found generated identities, checking for registration on backend...",);
@@ -62,13 +63,13 @@ impl GenerateIdentity {
             }
         }
         info!("Could not find identities to load, creating new identities");
-        let identities = self.create_identities(n).await?;
+        let identities = self.create_identities(n, 10).await?;
         self.identity_store
             .set_all(identities.as_slice(), &self.network)?;
         Ok(identities)
     }
 
-    pub async fn create_identities(&self, n: usize) -> Result<Vec<Identity>> {
+    pub async fn create_identities(&self, n: usize, concurrency: usize) -> Result<Vec<Identity>> {
         let mut identities: Vec<Identity> = Vec::with_capacity(n);
 
         let style = ProgressStyle::with_template(
@@ -78,10 +79,15 @@ impl GenerateIdentity {
         let mut set: tokio::task::JoinSet<Result<_, eyre::Error>> = tokio::task::JoinSet::new();
 
         let network = &self.network;
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
         for _ in 0..n {
             let bar_pointer = bar.clone();
             let network = network.clone();
+            let semaphore = semaphore.clone();
             set.spawn(async move {
+                let _permit = semaphore.acquire().await?;
                 let wallet = crate::app::generate_wallet();
                 // TODO: maybe create all new clients in a temp directory
                 // then copy + store at the same time
@@ -129,7 +135,10 @@ impl GenerateIdentity {
         let future = |inbox_id: [u8; 32]| async move {
             let id = hex::encode(inbox_id);
             trace!(inbox_id = id, "getting association state");
-            let state = tmp.get_latest_association_state(&conn, &id).await?;
+            let state = tmp
+                .identity_updates()
+                .get_latest_association_state(&conn, &id)
+                .await?;
             bar_ref.inc(1);
             Ok(state)
         };

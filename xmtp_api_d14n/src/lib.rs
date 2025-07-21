@@ -40,14 +40,6 @@ pub mod tests {
     pub type TestV3Client = V3Client<TestClient>;
     pub type TestD14nClient = D14nClient<TestClient, TestClient>;
 
-    // Execute once before any tests are run
-    #[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
-    #[cfg(not(target_arch = "wasm32"))]
-    #[cfg(test)]
-    fn _setup() {
-        xmtp_common::logger();
-    }
-
     impl<C, Payer> XmtpTestClient for D14nClient<C, Payer>
     where
         C: XmtpTestClient + Client,
@@ -58,6 +50,17 @@ pub mod tests {
             ApiBuilder<Error = <<Payer as XmtpTestClient>::Builder as ApiBuilder>::Error>,
     {
         type Builder = D14nClientBuilder<C::Builder, Payer::Builder>;
+
+        fn local_port() -> &'static str {
+            "5055"
+        }
+
+        fn create_custom(_addr: &str) -> Self::Builder {
+            D14nClientBuilder::new(
+                <C as XmtpTestClient>::create_local_d14n(),
+                <Payer as XmtpTestClient>::create_local_d14n(),
+            )
+        }
 
         fn create_local() -> Self::Builder {
             D14nClientBuilder::new(
@@ -92,6 +95,14 @@ pub mod tests {
         <<C as XmtpTestClient>::Builder as ApiBuilder>::Output: Client,
     {
         type Builder = V3ClientBuilder<C::Builder>;
+
+        fn local_port() -> &'static str {
+            "5055"
+        }
+
+        fn create_custom(addr: &str) -> Self::Builder {
+            V3ClientBuilder::new(<C as XmtpTestClient>::create_custom(addr))
+        }
 
         fn create_local() -> Self::Builder {
             V3ClientBuilder::new(<C as XmtpTestClient>::create_local())

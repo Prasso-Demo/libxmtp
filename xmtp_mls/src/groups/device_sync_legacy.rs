@@ -1,11 +1,11 @@
 #![allow(unused, dead_code)]
 // TODO: Delete this on the next hammer version.
-use super::device_sync::handle::{SyncMetric, WorkerHandle};
 use super::device_sync::preference_sync::PreferenceUpdate;
-use super::device_sync::DeviceSyncError;
-use super::scoped_client::ScopedGroupClient;
+use super::device_sync::worker::SyncMetric;
+use super::device_sync::{DeviceSyncClient, DeviceSyncError};
 use crate::subscriptions::SyncWorkerEvent;
-use crate::{configuration::NS_IN_HOUR, subscriptions::LocalEvents, Client};
+use crate::worker::metrics::WorkerMetrics;
+use crate::{subscriptions::LocalEvents, Client};
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -15,6 +15,7 @@ use preference_sync_legacy::LegacyUserPreferenceUpdate;
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use xmtp_common::time::now_ns;
+use xmtp_common::NS_IN_HOUR;
 use xmtp_cryptography::utils as crypto_utils;
 use xmtp_db::consent_record::StoredConsentRecord;
 use xmtp_db::group::{ConversationType, GroupQueryArgs, StoredGroup};
@@ -56,7 +57,7 @@ pub(super) enum Syncable {
     ConsentRecord(StoredConsentRecord),
 }
 
-impl<ApiClient, Db> Client<ApiClient, Db>
+impl<ApiClient, Db> DeviceSyncClient<ApiClient, Db>
 where
     ApiClient: XmtpApi,
     Db: xmtp_db::XmtpDb,
@@ -67,7 +68,7 @@ where
     ) -> Result<DeviceSyncRequestProto, DeviceSyncError> {
         tracing::info!(
             inbox_id = self.inbox_id(),
-            installation_id = hex::encode(self.installation_public_key()),
+            installation_id = hex::encode(self.installation_id()),
             "Sending a sync request for {kind:?}"
         );
         let request = DeviceSyncRequest::new(kind);
@@ -108,16 +109,14 @@ where
     pub(super) async fn v1_reply_to_sync_request(
         &self,
         request: DeviceSyncRequestProto,
-        handle: &WorkerHandle<SyncMetric>,
+        handle: &WorkerMetrics<SyncMetric>,
     ) -> Result<DeviceSyncReplyProto, DeviceSyncError> {
         let records = match request.kind() {
             BackupElementSelection::Consent => vec![self.v1_syncable_consent_records()?],
             BackupElementSelection::Messages => {
                 vec![self.v1_syncable_groups()?, self.v1_syncable_messages()?]
             }
-            BackupElementSelection::Unspecified => {
-                return Err(DeviceSyncError::UnspecifiedDeviceSyncKind)
-            }
+            _ => return Err(DeviceSyncError::UnspecifiedDeviceSyncKind),
         };
 
         let reply = self
@@ -239,7 +238,7 @@ where
         &self,
         reply: DeviceSyncReplyProto,
     ) -> Result<(), DeviceSyncError> {
-        let provider = self.mls_provider();
+        let provider = self.context.mls_provider();
 
         #[allow(deprecated)]
         let time_diff = reply.timestamp_ns.abs_diff(now_ns() as u64);
@@ -257,21 +256,20 @@ where
         self.v1_insert_encrypted_syncables(enc_payload, &enc_key.try_into()?)
             .await?;
 
-        self.sync_welcomes().await?;
+        self.welcome_service.sync_welcomes().await?;
 
         let groups = self.context.db().find_groups(GroupQueryArgs {
             conversation_type: Some(ConversationType::Group),
             ..Default::default()
         })?;
         for StoredGroup { id, .. } in groups.into_iter() {
-            let group = self.group(&id)?;
-            group.maybe_update_installations(None).await?;
+            let group = self.mls_store.group(&id)?;
             Box::pin(group.sync_with_conn()).await?;
+            group.maybe_update_installations(None).await?;
         }
 
-        if let Some(handle) = self.worker_handle() {
-            handle.increment_metric(SyncMetric::V1PayloadProcessed);
-        }
+        self.metrics
+            .increment_metric(SyncMetric::V1PayloadProcessed);
 
         Ok(())
     }
@@ -285,13 +283,13 @@ where
         let (payload, enc_key) = encrypt_syncables(syncables)?;
 
         // upload the payload
-        let Some(url) = &self.device_sync.server_url else {
+        let Some(url) = &self.context.device_sync.server_url else {
             return Err(DeviceSyncError::MissingSyncServerUrl);
         };
         let upload_url = format!("{url}/upload");
         tracing::info!(
             inbox_id = self.inbox_id(),
-            installation_id = hex::encode(self.installation_public_key()),
+            installation_id = hex::encode(self.context.installation_public_key()),
             "Using upload url {upload_url}",
         );
 
@@ -304,7 +302,7 @@ where
         if !response.status().is_success() {
             tracing::error!(
                 inbox_id = self.inbox_id(),
-                installation_id = hex::encode(self.installation_public_key()),
+                installation_id = hex::encode(self.context.installation_public_key()),
                 "Failed to upload file. Status code: {} Response: {response:?}",
                 response.status()
             );
@@ -593,16 +591,17 @@ fn encrypt_syncables_with_key(
 
 #[cfg(test)]
 mod tests {
-
     use xmtp_proto::xmtp::device_sync::BackupElementSelection;
 
     use crate::{
-        groups::device_sync::handle::SyncMetric,
+        groups::device_sync::worker::SyncMetric,
         tester,
         utils::{LocalTesterBuilder, Tester},
     };
 
-    #[xmtp_common::test(unwrap_try = "true")]
+    #[rstest::rstest]
+    #[xmtp_common::test(unwrap_try = true)]
+    #[cfg_attr(target_arch = "wasm32", ignore)]
     async fn v1_sync_still_works() {
         tester!(alix1, sync_worker, sync_server);
         tester!(alix2, from: alix1);
@@ -611,13 +610,19 @@ mod tests {
 
         alix1.worker().wait(SyncMetric::PayloadSent, 1).await?;
 
-        alix2.get_sync_group().await?.sync().await?;
+        alix2
+            .device_sync_client()
+            .get_sync_group()
+            .await?
+            .sync()
+            .await?;
         alix2.worker().wait(SyncMetric::PayloadProcessed, 1).await?;
 
         assert_eq!(alix1.worker().get(SyncMetric::V1PayloadSent), 0);
         assert_eq!(alix2.worker().get(SyncMetric::V1PayloadProcessed), 0);
 
         alix2
+            .device_sync_client()
             .v1_send_sync_request(BackupElementSelection::Messages)
             .await?;
         alix1.sync_all_welcomes_and_history_sync_groups().await?;
@@ -630,6 +635,7 @@ mod tests {
             .await?;
 
         alix2
+            .device_sync_client()
             .v1_send_sync_request(BackupElementSelection::Consent)
             .await?;
         alix1.sync_all_welcomes_and_history_sync_groups().await?;

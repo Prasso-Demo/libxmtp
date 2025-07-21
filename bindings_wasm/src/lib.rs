@@ -14,6 +14,7 @@ pub mod signatures;
 pub mod streams;
 mod user_preferences;
 
+#[allow(dead_code)]
 fn error(e: impl std::error::Error) -> JsError {
   JsError::new(&format!("{}", e))
 }
@@ -27,5 +28,5 @@ pub(crate) fn to_value<T: serde::ser::Serialize + ?Sized>(
   value.serialize(&Serializer::new().serialize_large_number_types_as_bigints(true))
 }
 
-#[cfg(test)]
-mod tests;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod tests;

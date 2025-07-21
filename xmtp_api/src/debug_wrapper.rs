@@ -3,6 +3,9 @@ use xmtp_common::RetryableError;
 use xmtp_proto::api_client::AggregateStats;
 use xmtp_proto::api_client::ApiStats;
 use xmtp_proto::api_client::IdentityStats;
+use xmtp_proto::mls_v1::{
+    BatchPublishCommitLogRequest, BatchQueryCommitLogRequest, BatchQueryCommitLogResponse,
+};
 use xmtp_proto::traits::HasStats;
 use xmtp_proto::xmtp::identity::api::v1::GetIdentityUpdatesRequest as GetIdentityUpdatesV2Request;
 use xmtp_proto::xmtp::identity::api::v1::GetIdentityUpdatesResponse as GetIdentityUpdatesV2Response;
@@ -66,6 +69,15 @@ where
         }
     } else {
         res
+    }
+}
+
+impl<A> HasStats for ApiDebugWrapper<A>
+where
+    A: HasStats,
+{
+    fn aggregate_stats(&self) -> AggregateStats {
+        self.inner.aggregate_stats()
     }
 }
 
@@ -145,6 +157,28 @@ where
         .await
     }
 
+    async fn publish_commit_log(
+        &self,
+        request: BatchPublishCommitLogRequest,
+    ) -> Result<(), Self::Error> {
+        wrap_err(
+            || self.inner.publish_commit_log(request),
+            || self.inner.aggregate_stats(),
+        )
+        .await
+    }
+
+    async fn query_commit_log(
+        &self,
+        request: BatchQueryCommitLogRequest,
+    ) -> Result<BatchQueryCommitLogResponse, Self::Error> {
+        wrap_err(
+            || self.inner.query_commit_log(request),
+            || self.inner.aggregate_stats(),
+        )
+        .await
+    }
+
     fn stats(&self) -> ApiStats {
         self.inner.stats()
     }
@@ -158,16 +192,16 @@ where
     E: std::error::Error + RetryableError + Send + Sync + 'static,
     A: HasStats,
 {
-    type GroupMessageStream<'a> = <A as XmtpMlsStreams>::GroupMessageStream<'a>;
+    type GroupMessageStream = <A as XmtpMlsStreams>::GroupMessageStream;
 
-    type WelcomeMessageStream<'a> = <A as XmtpMlsStreams>::WelcomeMessageStream<'a>;
+    type WelcomeMessageStream = <A as XmtpMlsStreams>::WelcomeMessageStream;
 
     type Error = ApiClientError<E>;
 
     async fn subscribe_group_messages(
         &self,
         request: SubscribeGroupMessagesRequest,
-    ) -> Result<Self::GroupMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::GroupMessageStream, Self::Error> {
         wrap_err(
             || self.inner.subscribe_group_messages(request),
             || self.inner.aggregate_stats(),
@@ -178,7 +212,7 @@ where
     async fn subscribe_welcome_messages(
         &self,
         request: SubscribeWelcomeMessagesRequest,
-    ) -> Result<Self::WelcomeMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::WelcomeMessageStream, Self::Error> {
         wrap_err(
             || self.inner.subscribe_welcome_messages(request),
             || self.inner.aggregate_stats(),

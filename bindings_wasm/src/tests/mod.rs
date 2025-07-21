@@ -3,33 +3,46 @@ mod web;
 use crate::client::LogLevel;
 use crate::client::{create_client, Client, LogOptions};
 use crate::inbox_id::generate_inbox_id;
+use alloy::signers::SignerSync;
+use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
 use xmtp_api_http::constants::ApiUrls;
-use xmtp_cryptography::utils::{rng, LocalWallet};
+use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_id::InboxOwner;
 
-async fn create_test_client() -> Client {
+#[wasm_bindgen(js_name = createTestClient)]
+pub async fn create_test_client(path: Option<String>) -> Client {
   // crate::opfs::Opfs::wipe_files().await.unwrap();
-  let wallet = LocalWallet::new(&mut rng());
+  let wallet = generate_local_wallet();
   let account_address = wallet.get_identifier().unwrap_throw();
   let host = ApiUrls::LOCAL_ADDRESS.to_string();
   let inbox_id = generate_inbox_id(account_address.clone().into());
-  let db = xmtp_common::tmp_path();
-  create_client(
+  let mut client = create_client(
     host.clone(),
     inbox_id.unwrap(),
     account_address.into(),
-    Some(db),
+    path,
     None,
     None,
-    None,
+    Some(crate::client::DeviceSyncWorkerMode::Disabled),
     Some(LogOptions {
       structured: false,
       performance: true,
-      level: Some(LogLevel::Debug),
+      level: Some(LogLevel::Info),
     }),
+    None,
+    None,
   )
   .await
-  .unwrap()
+  .unwrap();
+  let request = client.create_inbox_signature_request().unwrap().unwrap();
+  let text = request.signature_text().await.unwrap();
+  let signature = wallet.sign_message_sync(text.as_bytes()).unwrap();
+  request
+    .add_ecdsa_signature(Uint8Array::from(&signature.as_bytes()[..]))
+    .await
+    .unwrap();
+  client.register_identity(request).await.unwrap();
+  client
 }

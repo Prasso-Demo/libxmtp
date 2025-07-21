@@ -2,6 +2,9 @@ pub use super::xmtp::message_api::v1::{
     BatchQueryRequest, BatchQueryResponse, Envelope, PagingInfo, PublishRequest, PublishResponse,
     QueryRequest, QueryResponse, SubscribeRequest,
 };
+use crate::mls_v1::{
+    BatchPublishCommitLogRequest, BatchQueryCommitLogRequest, BatchQueryCommitLogResponse,
+};
 use crate::xmtp::identity::api::v1::{
     GetIdentityUpdatesRequest as GetIdentityUpdatesV2Request,
     GetIdentityUpdatesResponse as GetIdentityUpdatesV2Response, GetInboxIdsRequest,
@@ -22,6 +25,8 @@ use xmtp_common::RetryableError;
 #[cfg(any(test, feature = "test-utils"))]
 pub trait XmtpTestClient {
     type Builder: ApiBuilder;
+    fn local_port() -> &'static str;
+    fn create_custom(addr: &str) -> Self::Builder;
     fn create_local() -> Self::Builder;
     fn create_local_d14n() -> Self::Builder;
     fn create_local_payer() -> Self::Builder;
@@ -102,6 +107,23 @@ pub struct ApiStats {
     pub query_welcome_messages: Arc<EndpointStats>,
     pub subscribe_messages: Arc<EndpointStats>,
     pub subscribe_welcomes: Arc<EndpointStats>,
+    pub publish_commit_log: Arc<EndpointStats>,
+    pub query_commit_log: Arc<EndpointStats>,
+}
+
+impl ApiStats {
+    pub fn clear(&self) {
+        self.upload_key_package.clear();
+        self.fetch_key_package.clear();
+        self.send_group_messages.clear();
+        self.send_welcome_messages.clear();
+        self.query_group_messages.clear();
+        self.query_welcome_messages.clear();
+        self.subscribe_messages.clear();
+        self.subscribe_welcomes.clear();
+        self.publish_commit_log.clear();
+        self.query_commit_log.clear();
+    }
 }
 
 #[derive(Clone, Default, Debug)]
@@ -110,6 +132,15 @@ pub struct IdentityStats {
     pub get_identity_updates_v2: Arc<EndpointStats>,
     pub get_inbox_ids: Arc<EndpointStats>,
     pub verify_smart_contract_wallet_signature: Arc<EndpointStats>,
+}
+
+impl IdentityStats {
+    pub fn clear(&self) {
+        self.publish_identity_update.clear();
+        self.get_identity_updates_v2.clear();
+        self.get_inbox_ids.clear();
+        self.verify_smart_contract_wallet_signature.clear();
+    }
 }
 
 pub struct AggregateStats {
@@ -168,6 +199,13 @@ impl std::fmt::Debug for AggregateStats {
             self.mls.subscribe_messages
         )?;
         writeln!(f, "SubscribeWelcomes       {}", self.mls.subscribe_welcomes)?;
+        writeln!(f, "============ Commit Log ============")?;
+        writeln!(
+            f,
+            "PublishCommitLog         {}",
+            self.mls.publish_commit_log
+        )?;
+        writeln!(f, "QueryCommitLog           {}", self.mls.query_commit_log)?;
         Ok(())
     }
 }
@@ -190,6 +228,9 @@ impl EndpointStats {
 
     pub fn get_count(&self) -> usize {
         self.request_count.load(Ordering::Relaxed)
+    }
+    pub fn clear(&self) {
+        self.request_count.store(0, Ordering::Relaxed)
     }
 }
 
@@ -221,6 +262,14 @@ pub trait XmtpMlsClient {
         &self,
         request: QueryWelcomeMessagesRequest,
     ) -> Result<QueryWelcomeMessagesResponse, Self::Error>;
+    async fn publish_commit_log(
+        &self,
+        request: BatchPublishCommitLogRequest,
+    ) -> Result<(), Self::Error>;
+    async fn query_commit_log(
+        &self,
+        request: BatchQueryCommitLogRequest,
+    ) -> Result<BatchQueryCommitLogResponse, Self::Error>;
     fn stats(&self) -> ApiStats;
 }
 
@@ -272,6 +321,20 @@ where
         request: QueryWelcomeMessagesRequest,
     ) -> Result<QueryWelcomeMessagesResponse, Self::Error> {
         (**self).query_welcome_messages(request).await
+    }
+
+    async fn publish_commit_log(
+        &self,
+        request: BatchPublishCommitLogRequest,
+    ) -> Result<(), Self::Error> {
+        (**self).publish_commit_log(request).await
+    }
+
+    async fn query_commit_log(
+        &self,
+        request: BatchQueryCommitLogRequest,
+    ) -> Result<BatchQueryCommitLogResponse, Self::Error> {
+        (**self).query_commit_log(request).await
     }
 
     fn stats(&self) -> ApiStats {
@@ -329,6 +392,20 @@ where
         (**self).query_welcome_messages(request).await
     }
 
+    async fn publish_commit_log(
+        &self,
+        request: BatchPublishCommitLogRequest,
+    ) -> Result<(), Self::Error> {
+        (**self).publish_commit_log(request).await
+    }
+
+    async fn query_commit_log(
+        &self,
+        request: BatchQueryCommitLogRequest,
+    ) -> Result<BatchQueryCommitLogResponse, Self::Error> {
+        (**self).query_commit_log(request).await
+    }
+
     fn stats(&self) -> ApiStats {
         (**self).stats()
     }
@@ -336,45 +413,36 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait XmtpMlsStreams {
-    type GroupMessageStream<'a>: Stream<Item = Result<GroupMessage, Self::Error>> + Send + 'a
-    where
-        Self: 'a;
+    type GroupMessageStream: Stream<Item = Result<GroupMessage, Self::Error>> + Send;
 
-    type WelcomeMessageStream<'a>: Stream<Item = Result<WelcomeMessage, Self::Error>> + Send + 'a
-    where
-        Self: 'a;
+    type WelcomeMessageStream: Stream<Item = Result<WelcomeMessage, Self::Error>> + Send;
     type Error: RetryableError + Send + Sync + 'static;
 
     async fn subscribe_group_messages(
         &self,
         request: SubscribeGroupMessagesRequest,
-    ) -> Result<Self::GroupMessageStream<'_>, Self::Error>;
+    ) -> Result<Self::GroupMessageStream, Self::Error>;
     async fn subscribe_welcome_messages(
         &self,
         request: SubscribeWelcomeMessagesRequest,
-    ) -> Result<Self::WelcomeMessageStream<'_>, Self::Error>;
+    ) -> Result<Self::WelcomeMessageStream, Self::Error>;
 }
 
 #[cfg(target_arch = "wasm32")]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait XmtpMlsStreams {
-    type GroupMessageStream<'a>: Stream<Item = Result<GroupMessage, Self::Error>> + 'a
-    where
-        Self: 'a;
-
-    type WelcomeMessageStream<'a>: Stream<Item = Result<WelcomeMessage, Self::Error>> + 'a
-    where
-        Self: 'a;
+    type GroupMessageStream: Stream<Item = Result<GroupMessage, Self::Error>>;
+    type WelcomeMessageStream: Stream<Item = Result<WelcomeMessage, Self::Error>>;
     type Error: RetryableError + Send + Sync + 'static;
 
     async fn subscribe_group_messages(
         &self,
         request: SubscribeGroupMessagesRequest,
-    ) -> Result<Self::GroupMessageStream<'_>, Self::Error>;
+    ) -> Result<Self::GroupMessageStream, Self::Error>;
     async fn subscribe_welcome_messages(
         &self,
         request: SubscribeWelcomeMessagesRequest,
-    ) -> Result<Self::WelcomeMessageStream<'_>, Self::Error>;
+    ) -> Result<Self::WelcomeMessageStream, Self::Error>;
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -385,27 +453,21 @@ where
 {
     type Error = <T as XmtpMlsStreams>::Error;
 
-    type GroupMessageStream<'a>
-        = <T as XmtpMlsStreams>::GroupMessageStream<'a>
-    where
-        Self: 'a;
+    type GroupMessageStream = <T as XmtpMlsStreams>::GroupMessageStream;
 
-    type WelcomeMessageStream<'a>
-        = <T as XmtpMlsStreams>::WelcomeMessageStream<'a>
-    where
-        Self: 'a;
+    type WelcomeMessageStream = <T as XmtpMlsStreams>::WelcomeMessageStream;
 
     async fn subscribe_group_messages(
         &self,
         request: SubscribeGroupMessagesRequest,
-    ) -> Result<Self::GroupMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::GroupMessageStream, Self::Error> {
         (**self).subscribe_group_messages(request).await
     }
 
     async fn subscribe_welcome_messages(
         &self,
         request: SubscribeWelcomeMessagesRequest,
-    ) -> Result<Self::WelcomeMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::WelcomeMessageStream, Self::Error> {
         (**self).subscribe_welcome_messages(request).await
     }
 }
@@ -418,27 +480,21 @@ where
 {
     type Error = <T as XmtpMlsStreams>::Error;
 
-    type GroupMessageStream<'a>
-        = <T as XmtpMlsStreams>::GroupMessageStream<'a>
-    where
-        Self: 'a;
+    type GroupMessageStream = <T as XmtpMlsStreams>::GroupMessageStream;
 
-    type WelcomeMessageStream<'a>
-        = <T as XmtpMlsStreams>::WelcomeMessageStream<'a>
-    where
-        Self: 'a;
+    type WelcomeMessageStream = <T as XmtpMlsStreams>::WelcomeMessageStream;
 
     async fn subscribe_group_messages(
         &self,
         request: SubscribeGroupMessagesRequest,
-    ) -> Result<Self::GroupMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::GroupMessageStream, Self::Error> {
         (**self).subscribe_group_messages(request).await
     }
 
     async fn subscribe_welcome_messages(
         &self,
         request: SubscribeWelcomeMessagesRequest,
-    ) -> Result<Self::WelcomeMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::WelcomeMessageStream, Self::Error> {
         (**self).subscribe_welcome_messages(request).await
     }
 }

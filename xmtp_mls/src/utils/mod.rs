@@ -8,6 +8,8 @@ pub mod test;
 #[cfg(any(test, feature = "test-utils"))]
 pub use self::test::*;
 
+pub mod events;
+
 pub mod hash {
     pub use xmtp_cryptography::hash::sha256_bytes as sha256;
 }
@@ -85,7 +87,7 @@ pub mod id {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VersionInfo {
     pkg_version: Arc<str>,
 }

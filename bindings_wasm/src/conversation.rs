@@ -1,4 +1,4 @@
-use crate::client::RustXmtpClient;
+use crate::client::RustMlsGroup;
 use crate::conversations::{ConversationDebugInfo, HmacKey, MessageDisappearingSettings};
 use crate::encoded_content::EncodedContent;
 use crate::identity::{Identifier, IdentityExt};
@@ -7,16 +7,19 @@ use crate::permissions::{MetadataField, PermissionPolicy, PermissionUpdateType};
 use crate::streams::{StreamCallback, StreamCloser};
 use crate::{consent_state::ConsentState, permissions::GroupPermissions};
 use std::collections::HashMap;
-use std::sync::Arc;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::{prelude::wasm_bindgen, JsError};
 use xmtp_db::group::{ConversationType, DmIdExt};
 use xmtp_db::group_message::MsgQueryArgs;
-use xmtp_mls::groups::{
-  group_metadata::GroupMetadata as XmtpGroupMetadata,
-  group_mutable_metadata::MetadataField as XmtpMetadataField,
-  intents::PermissionUpdateType as XmtpPermissionUpdateType,
-  members::PermissionLevel as XmtpPermissionLevel, MlsGroup, UpdateAdminListType,
+use xmtp_mls::{
+  common::{
+    group_metadata::GroupMetadata as XmtpGroupMetadata,
+    group_mutable_metadata::MetadataField as XmtpMetadataField,
+  },
+  groups::{
+    intents::PermissionUpdateType as XmtpPermissionUpdateType,
+    members::PermissionLevel as XmtpPermissionLevel, MlsGroup, UpdateAdminListType,
+  },
 };
 use xmtp_proto::xmtp::mls::message_contents::EncodedContent as XmtpEncodedContent;
 
@@ -95,7 +98,7 @@ impl GroupMember {
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct Conversation {
-  inner_client: Arc<RustXmtpClient>,
+  inner_group: RustMlsGroup,
   group_id: Vec<u8>,
   dm_id: Option<String>,
   created_at_ns: i64,
@@ -103,22 +106,22 @@ pub struct Conversation {
 
 impl Conversation {
   pub fn new(
-    inner_client: Arc<RustXmtpClient>,
+    inner_group: RustMlsGroup,
     group_id: Vec<u8>,
     dm_id: Option<String>,
     created_at_ns: i64,
   ) -> Self {
     Self {
-      inner_client,
+      inner_group,
       group_id,
       dm_id,
       created_at_ns,
     }
   }
 
-  pub fn to_mls_group(&self) -> MlsGroup<Arc<RustXmtpClient>> {
+  pub fn to_mls_group(&self) -> RustMlsGroup {
     MlsGroup::new(
-      self.inner_client.clone(),
+      self.inner_group.context.clone(),
       self.group_id.clone(),
       self.dm_id.clone(),
       self.created_at_ns,
@@ -126,13 +129,13 @@ impl Conversation {
   }
 }
 
-impl From<MlsGroup<RustXmtpClient>> for Conversation {
-  fn from(mls_group: MlsGroup<RustXmtpClient>) -> Self {
+impl From<RustMlsGroup> for Conversation {
+  fn from(mls_group: RustMlsGroup) -> Self {
     Conversation {
-      inner_client: mls_group.client,
-      group_id: mls_group.group_id,
-      dm_id: mls_group.dm_id,
+      group_id: mls_group.group_id.clone(),
+      dm_id: mls_group.dm_id.clone(),
       created_at_ns: mls_group.created_at_ns,
+      inner_group: mls_group,
     }
   }
 }
@@ -502,13 +505,15 @@ impl Conversation {
 
   #[wasm_bindgen(js_name = stream)]
   pub fn stream(&self, callback: StreamCallback) -> Result<StreamCloser, JsError> {
+    let on_close_cb = callback.clone();
     let stream_closer = MlsGroup::stream_with_callback(
-      self.inner_client.clone(),
+      self.inner_group.context.clone(),
       self.group_id.clone(),
       move |message| match message {
         Ok(item) => callback.on_message(item.into()),
         Err(e) => callback.on_error(JsError::from(e)),
       },
+      move || on_close_cb.on_close(),
     );
 
     Ok(StreamCloser::new(stream_closer))
@@ -557,7 +562,7 @@ impl Conversation {
 
   #[wasm_bindgen(js_name = dmPeerInboxId)]
   pub fn dm_peer_inbox_id(&self) -> Result<String, JsError> {
-    let inbox_id = self.inner_client.inbox_id();
+    let inbox_id = self.inner_group.context.inbox_id();
 
     Ok(
       self
@@ -617,8 +622,8 @@ impl Conversation {
     &self,
   ) -> Result<Option<MessageDisappearingSettings>, JsError> {
     let settings = self
-      .inner_client
-      .group_disappearing_settings(self.group_id.clone())
+      .inner_group
+      .disappearing_settings()
       .map_err(|e| JsError::new(&format!("{e}")))?;
 
     match settings {
@@ -641,9 +646,8 @@ impl Conversation {
     let group = self.to_mls_group();
 
     let dms = self
-      .inner_client
-      .clone()
-      .find_duplicate_dms_for_group(&self.group_id)
+      .inner_group
+      .find_duplicate_dms()
       .map_err(|e| JsError::new(&e.to_string()))?;
 
     let mut hmac_map: HashMap<String, Vec<HmacKey>> = HashMap::new();
@@ -682,6 +686,8 @@ impl Conversation {
       epoch: debug_info.epoch,
       maybe_forked: debug_info.maybe_forked,
       fork_details: debug_info.fork_details,
+      local_commit_log: debug_info.local_commit_log,
+      cursor: debug_info.cursor,
     })?)
   }
 
@@ -689,9 +695,8 @@ impl Conversation {
   pub async fn find_duplicate_dms(&self) -> Result<Vec<Conversation>, JsError> {
     // Await the async function first, then handle the error
     let dms = self
-      .inner_client
-      .clone()
-      .find_duplicate_dms_for_group(&self.group_id)
+      .inner_group
+      .find_duplicate_dms()
       .map_err(|e| JsError::new(&e.to_string()))?;
 
     let conversations: Vec<Conversation> = dms.into_iter().map(Into::into).collect();
@@ -722,6 +727,8 @@ mod tests {
       version_minor: 123,
       authority_id: String::from("test"),
       reference_id: None,
+      originator_id: None,
+      sequence_id: None,
     };
     crate::to_value(&stored_message).unwrap();
   }

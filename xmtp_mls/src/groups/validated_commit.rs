@@ -1,5 +1,14 @@
-use std::collections::HashSet;
-
+use super::{
+    group_membership::{GroupMembership, MembershipDiff},
+    group_permissions::{
+        extract_group_permissions, GroupMutablePermissions, GroupMutablePermissionsError,
+    },
+    MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_IMAGE_URL_LENGTH, MAX_GROUP_NAME_LENGTH,
+};
+use crate::{
+    context::{XmtpContextProvider, XmtpMlsLocalContext},
+    identity_updates::{IdentityUpdates, InstallationDiff, InstallationDiffError},
+};
 use openmls::{
     credentials::{errors::BasicCredentialError, BasicCredential, Credential as OpenMlsCredential},
     extensions::{Extension, Extensions, UnknownExtension},
@@ -8,39 +17,31 @@ use openmls::{
     prelude::{LeafNodeIndex, Sender},
     treesync::LeafNode,
 };
+
 use prost::Message;
+use serde::Serialize;
+use std::{collections::HashSet, sync::Arc};
 use thiserror::Error;
+use xmtp_api::XmtpApi;
+use xmtp_common::{retry::RetryableError, retryable};
+use xmtp_db::local_commit_log::CommitType;
+use xmtp_db::{StorageError, XmtpDb};
 #[cfg(doc)]
 use xmtp_id::associations::AssociationState;
 use xmtp_id::{associations::MemberIdentifier, InboxId};
+use xmtp_mls_common::{
+    group_metadata::{DmMembers, GroupMetadata, GroupMetadataError},
+    group_mutable_metadata::{
+        find_mutable_metadata_extension, GroupMutableMetadata, GroupMutableMetadataError,
+        MetadataField,
+    },
+};
 use xmtp_proto::xmtp::{
     identity::MlsCredential,
     mls::message_contents::{
         group_updated::{Inbox as InboxProto, MetadataFieldChange as MetadataFieldChangeProto},
         GroupMembershipChanges, GroupUpdated as GroupUpdatedProto,
     },
-};
-
-use crate::{
-    configuration::GROUP_MEMBERSHIP_EXTENSION_ID,
-    identity_updates::{InstallationDiff, InstallationDiffError},
-};
-use xmtp_db::StorageError;
-
-use xmtp_common::{retry::RetryableError, retryable};
-
-use super::{
-    group_membership::{GroupMembership, MembershipDiff},
-    group_metadata::{DmMembers, GroupMetadata, GroupMetadataError},
-    group_mutable_metadata::{
-        find_mutable_metadata_extension, GroupMutableMetadata, GroupMutableMetadataError,
-        MetadataField,
-    },
-    group_permissions::{
-        extract_group_permissions, GroupMutablePermissions, GroupMutablePermissionsError,
-    },
-    ScopedGroupClient, MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_IMAGE_URL_LENGTH,
-    MAX_GROUP_NAME_LENGTH,
 };
 
 #[derive(Debug, Error)]
@@ -56,7 +57,7 @@ pub enum CommitValidationError {
     #[error("Invalid version format: {0}")]
     InvalidVersionFormat(String),
     #[error("Minimum supported protocol version {0} exceeds current version")]
-    MinimumSupportedProtocolVersionExceedsCurrentVersion(String),
+    ProtocolVersionTooLow(String),
     // TODO: We will need to relax this once we support external joins
     #[error("Actor not a member of the group")]
     ActorNotMember,
@@ -107,7 +108,7 @@ impl RetryableError for CommitValidationError {
     }
 }
 
-#[derive(Clone, PartialEq, Hash)]
+#[derive(Clone, PartialEq, Hash, Serialize)]
 pub struct CommitParticipant {
     pub inbox_id: String,
     pub installation_id: Vec<u8>,
@@ -172,7 +173,7 @@ impl CommitParticipant {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MutableMetadataValidationInfo {
     pub metadata_field_changes: Vec<MetadataFieldChange>,
     pub admins_added: Vec<Inbox>,
@@ -194,7 +195,7 @@ impl MutableMetadataValidationInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Inbox {
     pub inbox_id: String,
     #[allow(dead_code)]
@@ -203,7 +204,7 @@ pub struct Inbox {
     pub is_super_admin: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MetadataFieldChange {
     pub field_name: String,
     #[allow(dead_code)]
@@ -287,23 +288,28 @@ impl LibXMTPVersion {
  * 7. New installations may be missing from the commit but still be present in the expected diff.
  * 8. Confirms metadata character limit is not exceeded
  */
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ValidatedCommit {
     pub actor: CommitParticipant,
     pub added_inboxes: Vec<Inbox>,
     pub removed_inboxes: Vec<Inbox>,
     pub metadata_validation_info: MutableMetadataValidationInfo,
+    pub installations_changed: bool,
     pub permissions_changed: bool,
     pub dm_members: Option<DmMembers<String>>,
 }
 
 impl ValidatedCommit {
-    pub async fn from_staged_commit(
-        client: impl ScopedGroupClient,
+    pub async fn from_staged_commit<ApiClient, Db>(
+        context: &Arc<XmtpMlsLocalContext<ApiClient, Db>>,
         staged_commit: &StagedCommit,
         openmls_group: &OpenMlsGroup,
-    ) -> Result<Self, CommitValidationError> {
-        let provider = client.mls_provider();
+    ) -> Result<Self, CommitValidationError>
+    where
+        ApiClient: XmtpApi,
+        Db: XmtpDb,
+    {
+        let provider = context.mls_provider();
         let conn = provider.db();
         // Get the immutable and mutable metadata
         let extensions = openmls_group.extensions();
@@ -384,13 +390,17 @@ impl ValidatedCommit {
         // group membership and the new group membership.
         // Also gets back the added and removed inbox ids from the expected diff
         let expected_diff =
-            ExpectedDiff::from_staged_commit(&client, staged_commit, openmls_group).await?;
+            ExpectedDiff::from_staged_commit(context, staged_commit, openmls_group).await?;
+
         let ExpectedDiff {
             new_group_membership,
             expected_installation_diff,
             added_inboxes,
             removed_inboxes,
         } = expected_diff;
+
+        let installations_changed =
+            !added_installations.is_empty() || !removed_installations.is_empty();
 
         // Ensure that the expected diff matches the added/removed installations in the proposals
         expected_diff_matches_commit(
@@ -411,7 +421,7 @@ impl ValidatedCommit {
                 .get(&participant.inbox_id)
                 .ok_or(CommitValidationError::SubjectDoesNotExist)?;
 
-            let inbox_state = client
+            let inbox_state = IdentityUpdates::new(context.clone())
                 .get_association_state(conn, &participant.inbox_id, Some(*to_sequence_id as i64))
                 .await
                 .map_err(InstallationDiffError::from)?;
@@ -431,6 +441,7 @@ impl ValidatedCommit {
             added_inboxes,
             removed_inboxes,
             metadata_validation_info,
+            installations_changed,
             permissions_changed,
             dm_members: immutable_metadata.dm_members,
         };
@@ -443,7 +454,7 @@ impl ValidatedCommit {
             .metadata_validation_info
             .minimum_supported_protocol_version
         {
-            let current_version = LibXMTPVersion::parse(client.version_info().pkg_version())?;
+            let current_version = LibXMTPVersion::parse(context.version_info().pkg_version())?;
             let min_supported_version = LibXMTPVersion::parse(min_version)?;
             tracing::info!(
                 "Validating commit with min_supported_version: {:?}, current_version: {:?}",
@@ -452,14 +463,36 @@ impl ValidatedCommit {
             );
 
             if min_supported_version > current_version {
-                return Err(
-                    CommitValidationError::MinimumSupportedProtocolVersionExceedsCurrentVersion(
-                        min_version.clone(),
-                    ),
-                );
+                return Err(CommitValidationError::ProtocolVersionTooLow(
+                    min_version.clone(),
+                ));
             }
         }
         Ok(verified_commit)
+    }
+
+    // Reuse intent kind here to represent the commit type, even if it's an external commit
+    // This is for debugging purposes only, so an approximation is fine
+    pub fn debug_commit_type(&self) -> CommitType {
+        let metadata_info = &self.metadata_validation_info;
+        if !self.added_inboxes.is_empty()
+            || !self.removed_inboxes.is_empty()
+            || self.installations_changed
+        {
+            CommitType::UpdateGroupMembership
+        } else if self.permissions_changed {
+            CommitType::UpdatePermission
+        } else if !metadata_info.admins_added.is_empty()
+            || !metadata_info.admins_removed.is_empty()
+            || !metadata_info.super_admins_added.is_empty()
+            || !metadata_info.super_admins_removed.is_empty()
+        {
+            CommitType::UpdateAdminList
+        } else if !metadata_info.metadata_field_changes.is_empty() {
+            CommitType::MetadataUpdate
+        } else {
+            CommitType::KeyUpdate
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -583,11 +616,15 @@ struct ExpectedDiff {
 }
 
 impl ExpectedDiff {
-    pub(super) async fn from_staged_commit(
-        client: impl ScopedGroupClient,
+    pub(super) async fn from_staged_commit<ApiClient, Db>(
+        context: &Arc<XmtpMlsLocalContext<ApiClient, Db>>,
         staged_commit: &StagedCommit,
         openmls_group: &OpenMlsGroup,
-    ) -> Result<Self, CommitValidationError> {
+    ) -> Result<Self, CommitValidationError>
+    where
+        ApiClient: XmtpApi,
+        Db: XmtpDb,
+    {
         // Get the immutable and mutable metadata
         let extensions = openmls_group.extensions();
         let immutable_metadata: GroupMetadata = extensions.try_into()?;
@@ -599,7 +636,7 @@ impl ExpectedDiff {
         }
 
         let expected_diff = Self::extract_expected_diff(
-            &client,
+            context,
             staged_commit,
             extensions,
             &immutable_metadata,
@@ -614,14 +651,18 @@ impl ExpectedDiff {
     /// [`GroupMembership`] and the [`GroupMembership`] found in the [`StagedCommit`].
     /// This requires loading the Inbox state from the network.
     /// Satisfies Rule 2
-    async fn extract_expected_diff(
-        client: impl ScopedGroupClient,
+    async fn extract_expected_diff<ApiClient, Db>(
+        context: &Arc<XmtpMlsLocalContext<ApiClient, Db>>,
         staged_commit: &StagedCommit,
         existing_group_extensions: &Extensions,
         immutable_metadata: &GroupMetadata,
         mutable_metadata: &GroupMutableMetadata,
-    ) -> Result<ExpectedDiff, CommitValidationError> {
-        let provider = client.mls_provider();
+    ) -> Result<ExpectedDiff, CommitValidationError>
+    where
+        ApiClient: XmtpApi,
+        Db: XmtpDb,
+    {
+        let provider = context.mls_provider();
         let conn = provider.db();
         let old_group_membership = extract_group_membership(existing_group_extensions)?;
         let new_group_membership = get_latest_group_membership(staged_commit)?;
@@ -644,8 +685,8 @@ impl ExpectedDiff {
             .iter()
             .map(|inbox_id| build_inbox(inbox_id, immutable_metadata, mutable_metadata))
             .collect::<Vec<Inbox>>();
-
-        let expected_installation_diff = client
+        let identity_updates = IdentityUpdates::new(context.clone());
+        let expected_installation_diff = identity_updates
             .get_installation_diff(
                 conn,
                 &old_group_membership,
@@ -771,7 +812,7 @@ pub fn extract_group_membership(
 ) -> Result<GroupMembership, CommitValidationError> {
     for extension in extensions.iter() {
         if let Extension::Unknown(
-            GROUP_MEMBERSHIP_EXTENSION_ID,
+            xmtp_mls_common::config::GROUP_MEMBERSHIP_EXTENSION_ID,
             UnknownExtension(group_membership),
         ) = extension
         {

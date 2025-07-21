@@ -1,7 +1,5 @@
 // @generated automatically by Diesel CLI.
 
-use super::schema::conversation_list;
-
 diesel::table! {
     association_state (inbox_id, sequence_id) {
         inbox_id -> Text,
@@ -16,6 +14,18 @@ diesel::table! {
         state -> Integer,
         entity -> Text,
         consented_at_ns -> BigInt,
+    }
+}
+
+diesel::table! {
+    events (rowid) {
+        rowid -> Integer,
+        created_at_ns -> BigInt,
+        group_id -> Nullable<Binary>,
+        event -> Text,
+        details -> Nullable<Binary>,
+        level -> Integer,
+        icon -> Nullable<Text>,
     }
 }
 
@@ -74,6 +84,7 @@ diesel::table! {
         fork_details -> Text,
         sequence_id -> Nullable<BigInt>,
         originator_id -> Nullable<BigInt>,
+        should_publish_commit_log -> Bool,
     }
 }
 
@@ -93,6 +104,7 @@ diesel::table! {
         installation_keys -> Binary,
         credential_bytes -> Binary,
         rowid -> Nullable<Integer>,
+        next_key_package_rotation_ns -> Nullable<BigInt>,
     }
 }
 
@@ -118,6 +130,24 @@ diesel::table! {
         id -> Integer,
         key_package_hash_ref -> Binary,
         created_at_ns -> BigInt,
+        delete_at_ns -> Nullable<BigInt>,
+        post_quantum_public_key -> Nullable<Binary>,
+    }
+}
+
+diesel::table! {
+    local_commit_log (rowid) {
+        rowid -> Integer,
+        group_id -> Binary,
+        commit_sequence_id -> BigInt,
+        last_epoch_authenticator -> Binary,
+        commit_result -> Integer,
+        error_message -> Nullable<Text>,
+        applied_epoch_number -> BigInt,
+        applied_epoch_authenticator -> Binary,
+        sender_inbox_id -> Nullable<Text>,
+        sender_installation_id -> Nullable<Binary>,
+        commit_type -> Nullable<Text>,
     }
 }
 
@@ -151,6 +181,18 @@ diesel::table! {
 }
 
 diesel::table! {
+    remote_commit_log (rowid) {
+        rowid -> Integer,
+        log_sequence_id -> BigInt,
+        group_id -> Binary,
+        commit_sequence_id -> BigInt,
+        commit_result -> Integer,
+        applied_epoch_number -> BigInt,
+        applied_epoch_authenticator -> Binary,
+    }
+}
+
+diesel::table! {
     user_preferences (id) {
         id -> Integer,
         hmac_key -> Nullable<Binary>,
@@ -164,6 +206,7 @@ diesel::joinable!(group_messages -> groups (group_id));
 diesel::allow_tables_to_appear_in_same_query!(
     association_state,
     consent_records,
+    events,
     group_intents,
     group_messages,
     groups,
@@ -172,10 +215,11 @@ diesel::allow_tables_to_appear_in_same_query!(
     identity_cache,
     identity_updates,
     key_package_history,
+    local_commit_log,
     openmls_key_store,
     openmls_key_value,
     processed_device_sync_messages,
     refresh_state,
+    remote_commit_log,
     user_preferences,
-    conversation_list
 );

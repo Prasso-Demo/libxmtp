@@ -1,41 +1,38 @@
 use crate::conversations::Conversations;
-use crate::identity::{Identifier, IdentityExt};
+use crate::identity::{ApiStats, Identifier, IdentityExt, IdentityStats};
 use crate::inbox_state::InboxState;
-use crate::signatures::SignatureRequestType;
+use crate::signatures::SignatureRequestHandle;
 use crate::ErrorWrapper;
 use napi::bindgen_prelude::{Error, Result, Uint8Array};
 use napi_derive::napi;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use xmtp_api::ApiDebugWrapper;
 pub use xmtp_api_grpc::grpc_api_helper::Client as TonicApiClient;
 use xmtp_db::{EncryptedMessageStore, EncryptionKey, NativeDb, StorageOption};
-use xmtp_id::associations::builder::SignatureRequest;
 use xmtp_mls::builder::SyncWorkerMode as XmtpSyncWorkerMode;
-use xmtp_mls::groups::scoped_client::LocalScopedGroupClient;
+use xmtp_mls::groups::MlsGroup;
 use xmtp_mls::identity::IdentityStrategy;
+use xmtp_mls::utils::events::upload_debug_archive;
 use xmtp_mls::Client as MlsClient;
+use xmtp_proto::api_client::AggregateStats;
 
 pub type RustXmtpClient = MlsClient<ApiDebugWrapper<TonicApiClient>>;
+pub type RustMlsGroup = MlsGroup<ApiDebugWrapper<TonicApiClient>, xmtp_db::DefaultStore>;
 static LOGGER_INIT: std::sync::OnceLock<Result<()>> = std::sync::OnceLock::new();
 
 #[napi]
+#[derive(Clone)]
 pub struct Client {
   inner_client: Arc<RustXmtpClient>,
-  signature_requests: Arc<Mutex<HashMap<SignatureRequestType, SignatureRequest>>>,
   pub account_identifier: Identifier,
 }
 
 impl Client {
   pub fn inner_client(&self) -> &Arc<RustXmtpClient> {
     &self.inner_client
-  }
-
-  pub fn signature_requests(&self) -> &Arc<Mutex<HashMap<SignatureRequestType, SignatureRequest>>> {
-    &self.signature_requests
   }
 }
 
@@ -102,7 +99,6 @@ fn init_logging(options: LogOptions) -> Result<()> {
       } else {
         EnvFilter::builder().parse_lossy("info")
       };
-
       if options.structured.unwrap_or_default() {
         let fmt = tracing_subscriber::fmt::layer()
           .json()
@@ -143,6 +139,8 @@ pub async fn create_client(
   device_sync_server_url: Option<String>,
   device_sync_worker_mode: Option<SyncWorkerMode>,
   log_options: Option<LogOptions>,
+  allow_offline: Option<bool>,
+  disable_events: Option<bool>,
 ) -> Result<Client> {
   let root_identifier = account_identifier.clone();
 
@@ -190,6 +188,8 @@ pub async fn create_client(
       .map_err(ErrorWrapper::from)?
       .with_remote_verifier()
       .map_err(ErrorWrapper::from)?
+      .with_allow_offline(allow_offline)
+      .with_disable_events(disable_events)
       .store(store)
       .device_sync_server_url(&url),
 
@@ -199,6 +199,8 @@ pub async fn create_client(
       .map_err(ErrorWrapper::from)?
       .with_remote_verifier()
       .map_err(ErrorWrapper::from)?
+      .with_allow_offline(allow_offline)
+      .with_disable_events(disable_events)
       .store(store),
   };
 
@@ -211,7 +213,6 @@ pub async fn create_client(
   Ok(Client {
     inner_client: Arc::new(xmtp_client),
     account_identifier: root_identifier,
-    signature_requests: Arc::new(Mutex::new(HashMap::new())),
   })
 }
 
@@ -259,26 +260,20 @@ impl Client {
   }
 
   #[napi]
-  pub async fn register_identity(&self) -> Result<()> {
+  pub async fn register_identity(&self, signature_request: &SignatureRequestHandle) -> Result<()> {
     if self.is_registered() {
       return Err(Error::from_reason(
         "An identity is already registered with this client",
       ));
     }
 
-    let mut signature_requests = self.signature_requests.lock().await;
-
-    let signature_request = signature_requests
-      .get(&SignatureRequestType::CreateInbox)
-      .ok_or(Error::from_reason("No signature request found"))?;
+    let inner = signature_request.inner().lock().await;
 
     self
       .inner_client
-      .register_identity(signature_request.clone())
+      .register_identity(inner.clone())
       .await
       .map_err(ErrorWrapper::from)?;
-
-    signature_requests.remove(&SignatureRequestType::CreateInbox);
 
     Ok(())
   }
@@ -292,6 +287,7 @@ impl Client {
   pub async fn send_sync_request(&self) -> Result<()> {
     self
       .inner_client
+      .device_sync_client()
       .send_sync_request()
       .await
       .map_err(ErrorWrapper::from)?;
@@ -344,5 +340,38 @@ impl Client {
     let num_groups_synced: u32 = num_groups_synced.try_into().map_err(ErrorWrapper::from)?;
 
     Ok(num_groups_synced)
+  }
+
+  #[napi]
+  pub fn api_statistics(&self) -> ApiStats {
+    self.inner_client.api_stats().into()
+  }
+
+  #[napi]
+  pub fn api_identity_statistics(&self) -> IdentityStats {
+    self.inner_client.identity_api_stats().into()
+  }
+
+  #[napi]
+  pub fn api_aggregate_statistics(&self) -> String {
+    let api = self.inner_client.api_stats();
+    let identity = self.inner_client.identity_api_stats();
+    let aggregate = AggregateStats { mls: api, identity };
+    format!("{:?}", aggregate)
+  }
+
+  #[napi]
+  pub fn clear_all_statistics(&self) {
+    self.inner_client.clear_stats()
+  }
+
+  #[napi]
+  pub async fn upload_debug_archive(&self, server_url: String) -> Result<String> {
+    let provider = Arc::new(self.inner_client().mls_provider());
+    Ok(
+      upload_debug_archive(&provider, Some(server_url))
+        .await
+        .map_err(ErrorWrapper::from)?,
+    )
   }
 }

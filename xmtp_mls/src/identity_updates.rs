@@ -1,10 +1,15 @@
 use crate::{
     client::ClientError,
+    context::{XmtpContextProvider, XmtpMlsLocalContext},
     groups::group_membership::{GroupMembership, MembershipDiff},
-    Client, XmtpApi,
+    subscriptions::SyncWorkerEvent,
+    XmtpApi,
 };
 use futures::future::try_join_all;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use thiserror::Error;
 use xmtp_common::{retry_async, retryable, Retry, RetryableError};
 use xmtp_cryptography::CredentialSign;
@@ -62,7 +67,129 @@ impl RetryableError for InstallationDiffError {
     }
 }
 
-impl<'a, ApiClient, Db> Client<ApiClient, Db>
+pub struct IdentityUpdates<ApiClient, Db> {
+    context: Arc<XmtpMlsLocalContext<ApiClient, Db>>,
+}
+
+impl<ApiClient, Db> IdentityUpdates<ApiClient, Db> {
+    pub fn new(context: Arc<XmtpMlsLocalContext<ApiClient, Db>>) -> Self {
+        Self { context }
+    }
+}
+
+/// Get the association state for a given inbox_id up to the (and inclusive of) the `to_sequence_id`
+/// If no `to_sequence_id` is provided, use the latest value in the database
+pub async fn get_association_state_with_verifier<C: ConnectionExt>(
+    conn: &DbConnection<C>,
+    inbox_id: &str,
+    to_sequence_id: Option<i64>,
+    scw_verifier: &impl SmartContractSignatureVerifier,
+) -> Result<AssociationState, ClientError> {
+    let updates = conn.get_identity_updates(inbox_id, None, to_sequence_id)?;
+    let last_sequence_id = updates
+        .last()
+        .ok_or::<ClientError>(AssociationError::MissingIdentityUpdate.into())?
+        .sequence_id;
+    if let Some(to_sequence_id) = to_sequence_id {
+        if to_sequence_id != last_sequence_id {
+            return Err(AssociationError::MissingIdentityUpdate.into());
+        }
+    }
+
+    if let Some(association_state) =
+        StoredAssociationState::read_from_cache(conn, inbox_id, last_sequence_id)?
+    {
+        return Ok(association_state);
+    }
+
+    let unverified_updates = updates
+        .into_iter()
+        // deserialize identity update payload
+        .map(UnverifiedIdentityUpdate::try_from)
+        .collect::<Result<Vec<UnverifiedIdentityUpdate>, AssociationError>>()?;
+    let updates = verify_updates(unverified_updates, scw_verifier).await?;
+
+    let association_state = get_state(updates)?;
+
+    StoredAssociationState::write_to_cache(
+        conn,
+        inbox_id.to_owned(),
+        last_sequence_id,
+        association_state.clone().into(),
+    )?;
+
+    Ok(association_state)
+}
+
+/// Revoke the given installations from the association state for the client's inbox
+pub async fn revoke_installations_with_verifier(
+    identifier: &Identifier,
+    inbox_id: &str,
+    installation_ids: Vec<Vec<u8>>,
+) -> Result<SignatureRequest, ClientError> {
+    let mut builder = SignatureRequestBuilder::new(inbox_id);
+
+    for installation_id in installation_ids {
+        builder = builder.revoke_association(
+            identifier.clone().into(),
+            MemberIdentifier::installation(installation_id),
+        )
+    }
+
+    Ok(builder.build())
+}
+
+/**
+ * Apply a signature request to the client's inbox by publishing the identity update to the network.
+ *
+ * This will error if the signature request is missing signatures, if the signatures are invalid,
+ * if the update fails other verifications, or if the update fails to be published to the network.
+ **/
+pub async fn apply_signature_request_with_verifier<ApiClient: XmtpApi>(
+    api_client: &ApiClientWrapper<ApiClient>,
+    signature_request: SignatureRequest,
+    scw_verifier: &impl SmartContractSignatureVerifier,
+) -> Result<(), ClientError> {
+    // If the signature request isn't completed, this will error
+    let identity_update = signature_request
+        .build_identity_update()
+        .map_err(IdentityUpdateError::from)?;
+
+    identity_update.to_verified(scw_verifier).await?;
+
+    // We don't need to validate the update, since the server will do this for us
+    api_client.publish_identity_update(identity_update).await?;
+
+    Ok(())
+}
+
+/// Get the association state for all provided `inbox_id`/optional `sequence_id` tuples, using the cache when available
+/// If the association state is not available in the cache, this falls back to reconstructing the association state
+/// from Identity Updates in the network.
+pub async fn batch_get_association_state_with_verifier<C: ConnectionExt>(
+    conn: &DbConnection<C>,
+    identifiers: &[(impl AsIdRef, Option<i64>)],
+    scw_verifier: &impl SmartContractSignatureVerifier,
+) -> Result<Vec<AssociationState>, ClientError> {
+    let association_states = try_join_all(
+        identifiers
+            .iter()
+            .map(|(inbox_id, to_sequence_id)| {
+                get_association_state_with_verifier(
+                    conn,
+                    inbox_id.as_ref(),
+                    *to_sequence_id,
+                    scw_verifier,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+
+    Ok(association_states)
+}
+
+impl<'a, ApiClient, Db> IdentityUpdates<ApiClient, Db>
 where
     ApiClient: XmtpApi,
     Db: XmtpDb,
@@ -75,17 +202,8 @@ where
         conn: &DbConnection<<Db as XmtpDb>::Connection>,
         identifiers: &[(impl AsIdRef, Option<i64>)],
     ) -> Result<Vec<AssociationState>, ClientError> {
-        let association_states = try_join_all(
-            identifiers
-                .iter()
-                .map(|(inbox_id, to_sequence_id)| {
-                    self.get_association_state(conn, inbox_id.as_ref(), *to_sequence_id)
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-
-        Ok(association_states)
+        batch_get_association_state_with_verifier(conn, identifiers, &self.context.scw_verifier)
+            .await
     }
 
     /// Get the latest association state available on the network for the given `inbox_id`
@@ -95,7 +213,7 @@ where
         conn: &DbConnection<<Db as XmtpDb>::Connection>,
         inbox_id: InboxIdRef<'a>,
     ) -> Result<AssociationState, ClientError> {
-        load_identity_updates(&self.api_client, conn, &[inbox_id]).await?;
+        load_identity_updates(self.context.api(), conn, &[inbox_id]).await?;
 
         self.get_association_state(conn, inbox_id, None).await
     }
@@ -108,40 +226,13 @@ where
         inbox_id: InboxIdRef<'a>,
         to_sequence_id: Option<i64>,
     ) -> Result<AssociationState, ClientError> {
-        let updates = conn.get_identity_updates(inbox_id, None, to_sequence_id)?;
-        let last_sequence_id = updates
-            .last()
-            .ok_or::<ClientError>(AssociationError::MissingIdentityUpdate.into())?
-            .sequence_id;
-        if let Some(to_sequence_id) = to_sequence_id {
-            if to_sequence_id != last_sequence_id {
-                return Err(AssociationError::MissingIdentityUpdate.into());
-            }
-        }
-
-        if let Some(association_state) =
-            StoredAssociationState::read_from_cache(conn, inbox_id, last_sequence_id)?
-        {
-            return Ok(association_state);
-        }
-
-        let unverified_updates = updates
-            .into_iter()
-            // deserialize identity update payload
-            .map(UnverifiedIdentityUpdate::try_from)
-            .collect::<Result<Vec<UnverifiedIdentityUpdate>, AssociationError>>()?;
-        let updates = verify_updates(unverified_updates, &self.scw_verifier).await?;
-
-        let association_state = get_state(updates)?;
-
-        StoredAssociationState::write_to_cache(
+        get_association_state_with_verifier(
             conn,
-            inbox_id.to_string(),
-            last_sequence_id,
-            association_state.clone().into(),
-        )?;
-
-        Ok(association_state)
+            inbox_id,
+            to_sequence_id,
+            &self.context.scw_verifier,
+        )
+        .await
     }
 
     /// Calculate the changes between the `starting_sequence_id` and `ending_sequence_id` for the
@@ -195,7 +286,7 @@ where
             .collect::<Result<Vec<UnverifiedIdentityUpdate>, AssociationError>>()?;
 
         let incremental_updates =
-            verify_updates(unverified_incremental_updates, &self.scw_verifier).await?;
+            verify_updates(unverified_incremental_updates, &self.context.scw_verifier).await?;
         let mut final_state = initial_state.clone();
         // Apply each update sequentially, aborting in the case of error
         for update in incremental_updates {
@@ -225,7 +316,7 @@ where
     ) -> Result<SignatureRequest, ClientError> {
         let nonce = maybe_nonce.unwrap_or(0);
         let inbox_id = identifier.inbox_id(nonce)?;
-        let installation_public_key = self.identity().installation_keys.verifying_key();
+        let installation_public_key = self.context.identity.installation_keys.verifying_key();
 
         let builder = SignatureRequestBuilder::new(inbox_id);
         let mut signature_request = builder
@@ -237,6 +328,7 @@ where
             .build();
 
         let sig_bytes = self
+            .context
             .identity()
             .sign_identity_update(signature_request.signature_text())?
             .to_vec();
@@ -247,7 +339,7 @@ where
                     sig_bytes,
                     installation_public_key,
                 )),
-                &self.scw_verifier,
+                &self.context.scw_verifier,
             )
             .await?;
 
@@ -260,16 +352,20 @@ where
         &self,
         new_identifier: Identifier,
     ) -> Result<SignatureRequest, ClientError> {
-        tracing::info!("Associating new wallet with inbox_id {}", self.inbox_id());
-        let inbox_id = self.inbox_id();
+        tracing::info!(
+            "Associating new wallet with inbox_id {}",
+            self.context.inbox_id()
+        );
+        let inbox_id = self.context.inbox_id();
         let builder = SignatureRequestBuilder::new(inbox_id);
-        let installation_public_key = self.identity().installation_keys.verifying_key();
+        let installation_public_key = self.context.identity().installation_keys.verifying_key();
 
         let mut signature_request = builder
             .add_association(new_identifier.into(), installation_public_key.into())
             .build();
 
         let signature = self
+            .context
             .identity()
             .installation_keys
             .credential_sign::<InstallationKeyContext>(signature_request.signature_text())?;
@@ -277,7 +373,7 @@ where
         signature_request
             .add_signature(
                 UnverifiedSignature::new_installation_key(signature, installation_public_key),
-                &self.scw_verifier,
+                &self.context.scw_verifier,
             )
             .await?;
 
@@ -289,7 +385,7 @@ where
         &self,
         identities_to_revoke: Vec<Identifier>,
     ) -> Result<SignatureRequest, ClientError> {
-        let inbox_id = self.inbox_id();
+        let inbox_id = self.context.inbox_id();
         let current_state = retry_async!(
             Retry::default(),
             (async {
@@ -314,8 +410,7 @@ where
         &self,
         installation_ids: Vec<Vec<u8>>,
     ) -> Result<SignatureRequest, ClientError> {
-        let inbox_id = self.inbox_id();
-
+        let inbox_id = self.context.inbox_id();
         let current_state = retry_async!(
             Retry::default(),
             (async {
@@ -324,18 +419,16 @@ where
             })
         )?;
 
-        let mut builder = SignatureRequestBuilder::new(inbox_id);
+        let result = revoke_installations_with_verifier(
+            &current_state.recovery_identifier().clone(),
+            inbox_id,
+            installation_ids,
+        )
+        .await?;
 
-        for installation_id in installation_ids {
-            builder = builder.revoke_association(
-                current_state.recovery_identifier().clone().into(),
-                MemberIdentifier::installation(installation_id),
-            )
-        }
+        let _ = self.context.worker_events.send(SyncWorkerEvent::CycleHMAC);
 
-        // Cycle the HMAC key
-        self.cycle_hmac().await?;
-        Ok(builder.build())
+        Ok(result)
     }
 
     /// Generate a `ChangeRecoveryAddress` signature request using a new identifer
@@ -343,7 +436,7 @@ where
         &self,
         new_recovery_identifier: Identifier,
     ) -> Result<SignatureRequest, ClientError> {
-        let inbox_id = self.inbox_id();
+        let inbox_id = self.context.inbox_id();
         let current_state = retry_async!(
             Retry::default(),
             (async {
@@ -369,23 +462,19 @@ where
         signature_request: SignatureRequest,
     ) -> Result<(), ClientError> {
         let inbox_id = signature_request.inbox_id().to_string();
-        // If the signature request isn't completed, this will error
-        let identity_update = signature_request
-            .build_identity_update()
-            .map_err(IdentityUpdateError::from)?;
 
-        identity_update.to_verified(self.scw_verifier()).await?;
-
-        // We don't need to validate the update, since the server will do this for us
-        self.api_client
-            .publish_identity_update(identity_update)
-            .await?;
+        apply_signature_request_with_verifier(
+            self.context.api(),
+            signature_request,
+            self.context.scw_verifier(),
+        )
+        .await?;
 
         // Load the identity updates for the inbox so that we have a record in our DB
         retry_async!(
             Retry::default(),
             (async {
-                load_identity_updates(&self.api_client, &self.context.db(), &[inbox_id.as_str()])
+                load_identity_updates(self.context.api(), &self.context.db(), &[inbox_id.as_str()])
                     .await
             })
         )?;
@@ -424,7 +513,7 @@ where
             .collect::<Vec<(&str, i64)>>();
 
         load_identity_updates(
-            &self.api_client,
+            self.context.api(),
             conn,
             &conn.filter_inbox_ids_needing_updates(filters.as_slice())?,
         )
@@ -585,16 +674,25 @@ pub(crate) mod tests {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
     use crate::{
-        builder::ClientBuilder, groups::group_membership::GroupMembership, utils::FullXmtpClient,
-        utils::Tester, Client, XmtpApi,
+        builder::ClientBuilder,
+        context::XmtpContextProvider,
+        groups::group_membership::GroupMembership,
+        identity_updates::IdentityUpdates,
+        tester,
+        utils::{FullXmtpClient, Tester},
+        Client, XmtpApi,
     };
-    use ethers::signers::{LocalWallet, Signer};
+    use alloy::signers::Signer;
+    use xmtp_api::IdentityUpdate;
     use xmtp_cryptography::utils::generate_local_wallet;
-    use xmtp_id::associations::{
-        builder::{SignatureRequest, SignatureRequestError},
-        test_utils::{add_wallet_signature, MockSmartContractSignatureVerifier, WalletTestExt},
-        unverified::UnverifiedSignature,
-        AssociationState, MemberIdentifier,
+    use xmtp_id::{
+        associations::{
+            builder::{SignatureRequest, SignatureRequestError},
+            test_utils::{add_wallet_signature, MockSmartContractSignatureVerifier, WalletTestExt},
+            unverified::UnverifiedSignature,
+            AssociationState, MemberIdentifier,
+        },
+        InboxOwner,
     };
 
     use xmtp_db::{
@@ -613,11 +711,11 @@ pub(crate) mod tests {
         ApiClient: XmtpApi,
     {
         let conn = client.context.db();
-        load_identity_updates(&client.api_client, &conn, &[inbox_id])
+        load_identity_updates(client.context.api(), &conn, &[inbox_id])
             .await
             .unwrap();
 
-        client
+        IdentityUpdates::new(client.context.clone())
             .get_association_state(&conn, inbox_id, None)
             .await
             .unwrap()
@@ -634,23 +732,27 @@ pub(crate) mod tests {
             .expect("insert should succeed");
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[rstest::rstest]
+    #[xmtp_common::test]
     async fn test_is_member_of_association_state() {
         let wallet = generate_local_wallet();
         let client = ClientBuilder::new_test_client(&wallet).await;
 
         let wallet2 = generate_local_wallet();
+        let client_identity_updates = IdentityUpdates::new(client.context.clone());
 
-        let mut request = client
+        let mut request = client_identity_updates
             .associate_identity(wallet2.identifier())
             .await
             .unwrap();
         add_wallet_signature(&mut request, &wallet2).await;
-        client.apply_signature_request(request).await.unwrap();
+        client_identity_updates
+            .apply_signature_request(request)
+            .await
+            .unwrap();
 
         let conn = client.context.db();
-        let state = client
+        let state = client_identity_updates
             .get_latest_association_state(&conn, client.inbox_id())
             .await
             .unwrap();
@@ -658,7 +760,7 @@ pub(crate) mod tests {
         // The installation, wallet1 address, and the newly associated wallet2 address
         assert_eq!(state.members().len(), 3);
 
-        let api_client = &client.api_client;
+        let api_client = client.api();
 
         // Check that the second wallet is associated with our new static helper
         let is_member = is_member_of_association_state(
@@ -673,6 +775,7 @@ pub(crate) mod tests {
         assert!(is_member);
     }
 
+    #[rstest::rstest]
     #[xmtp_common::test]
     async fn create_inbox_round_trip() {
         let wallet = generate_local_wallet();
@@ -680,6 +783,7 @@ pub(crate) mod tests {
         let client = ClientBuilder::new_test_client(&wallet).await;
 
         let mut signature_request: SignatureRequest = client
+            .identity_updates()
             .create_inbox(wallet_ident.clone(), None)
             .await
             .unwrap();
@@ -688,6 +792,7 @@ pub(crate) mod tests {
         add_wallet_signature(&mut signature_request, &wallet).await;
 
         client
+            .identity_updates()
             .apply_signature_request(signature_request)
             .await
             .unwrap();
@@ -699,16 +804,16 @@ pub(crate) mod tests {
         assert!(association_state.get(&wallet_ident.into()).is_some())
     }
 
+    #[rstest::rstest]
     #[xmtp_common::test]
     async fn add_association() {
-        let wallet = generate_local_wallet();
         let wallet_2 = generate_local_wallet();
-        let wallet_ident = wallet.identifier();
         let wallet2_ident = wallet_2.identifier();
 
-        let client = ClientBuilder::new_test_client_no_sync(&wallet).await;
+        tester!(client);
 
         let mut add_association_request = client
+            .identity_updates()
             .associate_identity(wallet2_ident.clone())
             .await
             .unwrap();
@@ -716,31 +821,42 @@ pub(crate) mod tests {
         add_wallet_signature(&mut add_association_request, &wallet_2).await;
 
         client
+            .identity_updates()
             .apply_signature_request(add_association_request)
             .await
             .unwrap();
         let association_state = get_association_state(&client, client.inbox_id()).await;
 
-        let members = association_state.members_by_parent(&wallet_ident.clone().into());
+        let members = association_state
+            .members_by_parent(&client.builder.owner.get_identifier().unwrap().into());
         // Those members should have timestamps
         for member in members {
             assert!(member.client_timestamp_ns.is_some());
         }
 
         assert_eq!(association_state.members().len(), 3);
-        assert_eq!(association_state.recovery_identifier(), &wallet_ident);
+        assert_eq!(
+            *association_state.recovery_identifier(),
+            client.builder.owner.get_identifier().unwrap()
+        );
         assert!(association_state.get(&wallet2_ident.into()).is_some());
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     #[cfg(not(target_arch = "wasm32"))]
     fn cache_association_state() {
+        use std::sync::Arc;
+
         use xmtp_common::assert_logged;
+
+        use crate::{groups::device_sync::DeviceSyncClient, worker::metrics::WorkerMetrics};
 
         xmtp_common::traced_test!(async {
             let client = Tester::new().await;
             let inbox_id = client.inbox_id();
-            client.wait_for_sync_worker_init().await;
+            let metrics = WorkerMetrics::default();
+            let device_sync = DeviceSyncClient::new(&client.context, Arc::new(metrics));
+            device_sync.wait_for_sync_worker_init().await;
 
             let wallet_2 = generate_local_wallet();
 
@@ -765,6 +881,7 @@ pub(crate) mod tests {
             assert_logged!("Wrote association", 1);
 
             let mut add_association_request = client
+                .identity_updates()
                 .associate_identity(wallet_2.identifier())
                 .await
                 .unwrap();
@@ -772,6 +889,7 @@ pub(crate) mod tests {
             add_wallet_signature(&mut add_association_request, &wallet_2).await;
 
             client
+                .identity_updates()
                 .apply_signature_request(add_association_request)
                 .await
                 .unwrap();
@@ -797,6 +915,7 @@ pub(crate) mod tests {
         });
     }
 
+    #[rstest::rstest]
     #[xmtp_common::test]
     async fn load_identity_updates_if_needed() {
         let wallet = generate_local_wallet();
@@ -814,6 +933,7 @@ pub(crate) mod tests {
         assert_eq!(filtered.unwrap(), vec!["inbox_1"]);
     }
 
+    #[rstest::rstest]
     #[xmtp_common::test]
     async fn get_installation_diff() {
         let wallet_1 = generate_local_wallet();
@@ -836,6 +956,7 @@ pub(crate) mod tests {
             (client_3, wallet_3),
         ] {
             let mut signature_request: SignatureRequest = client
+                .identity_updates()
                 .create_inbox(wallet.identifier(), None)
                 .await
                 .unwrap();
@@ -844,11 +965,13 @@ pub(crate) mod tests {
 
             add_wallet_signature(&mut signature_request, &wallet).await;
             client
+                .identity_updates()
                 .apply_signature_request(signature_request)
                 .await
                 .unwrap();
             let new_wallet = generate_local_wallet();
             let mut add_association_request = client
+                .identity_updates()
                 .associate_identity(new_wallet.identifier())
                 .await
                 .unwrap();
@@ -856,6 +979,7 @@ pub(crate) mod tests {
             add_wallet_signature(&mut add_association_request, &new_wallet).await;
 
             client
+                .identity_updates()
                 .apply_signature_request(add_association_request)
                 .await
                 .unwrap();
@@ -866,7 +990,7 @@ pub(crate) mod tests {
         let other_conn = other_client.context.db();
         let ids = inbox_ids.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
         // Load all the identity updates for the new inboxes
-        load_identity_updates(&other_client.api_client, &other_conn, ids.as_slice())
+        load_identity_updates(other_client.api(), &other_conn, ids.as_slice())
             .await
             .expect("load should succeed");
 
@@ -902,6 +1026,7 @@ pub(crate) mod tests {
         let membership_diff = original_group_membership.diff(&new_group_membership);
 
         let installation_diff = other_client
+            .identity_updates()
             .get_installation_diff(
                 &other_conn,
                 &original_group_membership,
@@ -921,6 +1046,7 @@ pub(crate) mod tests {
             .contains(&client_2_installation_key.to_vec()));
     }
 
+    #[rstest::rstest]
     #[xmtp_common::test]
     pub async fn revoke_wallet() {
         let recovery_wallet = generate_local_wallet();
@@ -928,6 +1054,7 @@ pub(crate) mod tests {
         let client = ClientBuilder::new_test_client(&recovery_wallet).await;
 
         let mut add_wallet_signature_request = client
+            .identity_updates()
             .associate_identity(second_wallet.identifier())
             .await
             .unwrap();
@@ -935,6 +1062,7 @@ pub(crate) mod tests {
         add_wallet_signature(&mut add_wallet_signature_request, &second_wallet).await;
 
         client
+            .identity_updates()
             .apply_signature_request(add_wallet_signature_request)
             .await
             .unwrap();
@@ -944,7 +1072,7 @@ pub(crate) mod tests {
 
         // Make sure the inbox ID is correctly registered
         let inbox_ids = client
-            .api_client
+            .api()
             .get_inbox_ids(vec![second_wallet.identifier().into()])
             .await
             .unwrap();
@@ -953,12 +1081,14 @@ pub(crate) mod tests {
         // Now revoke the second wallet
 
         let mut revoke_signature_request = client
+            .identity_updates()
             .revoke_identities(vec![second_wallet.identifier()])
             .await
             .unwrap();
         add_wallet_signature(&mut revoke_signature_request, &recovery_wallet).await;
 
         client
+            .identity_updates()
             .apply_signature_request(revoke_signature_request)
             .await
             .unwrap();
@@ -970,13 +1100,14 @@ pub(crate) mod tests {
 
         // Make sure the inbox ID is correctly unregistered
         let inbox_ids = client
-            .api_client
+            .api()
             .get_inbox_ids(vec![second_wallet.identifier().into()])
             .await
             .unwrap();
         assert_eq!(inbox_ids.len(), 0);
     }
 
+    #[rstest::rstest]
     #[xmtp_common::test]
     pub async fn revoke_installation() {
         let wallet = generate_local_wallet();
@@ -989,11 +1120,13 @@ pub(crate) mod tests {
 
         // Now revoke the second client
         let mut revoke_installation_request = client1
+            .identity_updates()
             .revoke_installations(vec![client2.installation_public_key().to_vec()])
             .await
             .unwrap();
         add_wallet_signature(&mut revoke_installation_request, &wallet).await;
         client1
+            .identity_updates()
             .apply_signature_request(revoke_installation_request)
             .await
             .unwrap();
@@ -1023,11 +1156,13 @@ pub(crate) mod tests {
 
         // Now revoke the second client
         let mut revoke_installation_request = client1
+            .identity_updates()
             .revoke_installations(vec![client2.installation_public_key().to_vec()])
             .await
             .unwrap();
         add_wallet_signature(&mut revoke_installation_request, &wallet).await;
         client1
+            .identity_updates()
             .apply_signature_request(revoke_installation_request)
             .await
             .unwrap();
@@ -1058,11 +1193,13 @@ pub(crate) mod tests {
 
         // Now revoke the second client
         let mut revoke_installation_request = client1
+            .identity_updates()
             .revoke_installations(vec![client3.installation_public_key().to_vec()])
             .await
             .unwrap();
         add_wallet_signature(&mut revoke_installation_request, &wallet).await;
         client1
+            .identity_updates()
             .apply_signature_request(revoke_installation_request)
             .await
             .unwrap();
@@ -1072,10 +1209,10 @@ pub(crate) mod tests {
         assert_eq!(association_state.installation_ids().len(), 2);
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[rstest::rstest]
+    #[xmtp_common::test]
     pub async fn change_recovery_address() {
-        let original_wallet: LocalWallet = generate_local_wallet();
+        let original_wallet = generate_local_wallet();
         let new_recovery_wallet = generate_local_wallet();
         let client = ClientBuilder::new_test_client(&original_wallet).await;
 
@@ -1115,6 +1252,7 @@ pub(crate) mod tests {
 
         // Create a signature request to change the recovery address
         let mut change_recovery_request = client
+            .identity_updates()
             .change_recovery_identifier(new_recovery_wallet.identifier())
             .await
             .unwrap();
@@ -1124,6 +1262,7 @@ pub(crate) mod tests {
 
         // Apply the signature request
         client
+            .identity_updates()
             .apply_signature_request(change_recovery_request)
             .await
             .unwrap();
@@ -1166,6 +1305,7 @@ pub(crate) mod tests {
         // by attempting to revoke an installation with the original wallet
         let installation_id = client.installation_public_key().to_vec();
         let mut revoke_installation_request = client
+            .identity_updates()
             .revoke_installations(vec![installation_id])
             .await
             .unwrap();
@@ -1174,9 +1314,10 @@ pub(crate) mod tests {
         // add_wallet_signature(&mut revoke_installation_request, &original_wallet).await;
         let signature_text = revoke_installation_request.signature_text();
         let sig = original_wallet
-            .sign_message(signature_text)
+            .sign_message(signature_text.as_bytes())
             .await
             .unwrap()
+            .as_bytes()
             .to_vec();
         let unverified_sig = UnverifiedSignature::new_recoverable_ecdsa(sig);
         let scw_verifier = MockSmartContractSignatureVerifier::new(false);
@@ -1193,6 +1334,7 @@ pub(crate) mod tests {
         // Now try with the new recovery wallet (which should succeed)
         let installation_id = client.installation_public_key().to_vec();
         let mut revoke_installation_request = client
+            .identity_updates()
             .revoke_installations(vec![installation_id])
             .await
             .unwrap();
@@ -1202,6 +1344,7 @@ pub(crate) mod tests {
 
         // This should succeed because the new wallet is now the recovery address
         client
+            .identity_updates()
             .apply_signature_request(revoke_installation_request)
             .await
             .unwrap();

@@ -4,19 +4,21 @@ use prost::Message;
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{broadcast, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::instrument;
 
+use tracing::instrument;
 use xmtp_db::XmtpDb;
 use xmtp_proto::{api_client::XmtpMlsStreams, xmtp::mls::api::v1::WelcomeMessage};
 
+use process_welcome::ProcessWelcomeResult;
 use stream_all::StreamAllMessages;
-use stream_conversations::{ProcessWelcomeResult, StreamConversations, WelcomeOrGroup};
+use stream_conversations::{StreamConversations, WelcomeOrGroup};
 
-pub mod process_message;
-pub mod process_welcome;
+pub(super) mod process_message;
+pub(super) mod process_welcome;
 mod stream_all;
 mod stream_conversations;
 pub(crate) mod stream_messages;
+mod stream_utils;
 
 use crate::{
     groups::{
@@ -54,7 +56,6 @@ impl RetryableError for LocalEventError {
 pub enum LocalEvents {
     // a new group was created
     NewGroup(Vec<u8>),
-    SyncWorkerEvent(SyncWorkerEvent),
     PreferencesChanged(Vec<PreferenceUpdate>),
 }
 
@@ -64,6 +65,7 @@ pub enum SyncWorkerEvent {
     NewSyncGroupMsg,
     // The sync worker will auto-sync these with other devices.
     SyncPreferences(Vec<PreferenceUpdate>),
+    CycleHMAC,
 
     // TODO: Device Sync V1 below - Delete when V1 is deleted
     Request { message_id: Vec<u8> },
@@ -76,15 +78,6 @@ impl LocalEvents {
         // this is just to protect against any future variants
         match self {
             NewGroup(c) => Some(c),
-            _ => None,
-        }
-    }
-
-    fn sync_filter(self) -> Option<Self> {
-        use LocalEvents::*;
-
-        match &self {
-            SyncWorkerEvent(_) => Some(self),
             _ => None,
         }
     }
@@ -124,21 +117,11 @@ impl LocalEvents {
 }
 
 pub(crate) trait StreamMessages {
-    fn stream_sync_messages(self) -> impl Stream<Item = Result<LocalEvents>>;
     fn stream_consent_updates(self) -> impl Stream<Item = Result<Vec<StoredConsentRecord>>>;
     fn stream_preference_updates(self) -> impl Stream<Item = Result<Vec<PreferenceUpdate>>>;
 }
 
 impl StreamMessages for broadcast::Receiver<LocalEvents> {
-    #[instrument(level = "debug", skip_all)]
-    fn stream_sync_messages(self) -> impl Stream<Item = Result<LocalEvents>> {
-        BroadcastStream::new(self).filter_map(|event| async {
-            xmtp_common::optify!(event, "Missed message due to event queue lag")
-                .and_then(LocalEvents::sync_filter)
-                .map(Result::Ok)
-        })
-    }
-
     #[instrument(level = "debug", skip_all)]
     fn stream_consent_updates(self) -> impl Stream<Item = Result<Vec<StoredConsentRecord>>> {
         BroadcastStream::new(self).filter_map(|event| async {
@@ -161,14 +144,14 @@ impl StreamMessages for broadcast::Receiver<LocalEvents> {
 #[derive(thiserror::Error, Debug)]
 pub enum SubscribeError {
     #[error(transparent)]
-    Group(#[from] GroupError),
+    Group(#[from] Box<GroupError>),
     #[error(transparent)]
     NotFound(#[from] NotFound),
     // TODO: Add this to `NotFound`
     #[error("group message expected in database but is missing")]
     GroupMessageNotFound,
     #[error("processing group message in stream: {0}")]
-    ReceiveGroup(#[from] GroupMessageProcessingError),
+    ReceiveGroup(#[from] Box<GroupMessageProcessingError>),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -183,6 +166,18 @@ pub enum SubscribeError {
     BoxError(Box<dyn RetryableError + Send + Sync>),
     #[error(transparent)]
     Db(#[from] xmtp_db::ConnectionError),
+}
+
+impl From<GroupError> for SubscribeError {
+    fn from(value: GroupError) -> Self {
+        SubscribeError::Group(Box::new(value))
+    }
+}
+
+impl From<GroupMessageProcessingError> for SubscribeError {
+    fn from(value: GroupMessageProcessingError) -> Self {
+        SubscribeError::ReceiveGroup(Box::new(value))
+    }
 }
 
 impl RetryableError for SubscribeError {
@@ -215,7 +210,7 @@ where
     pub async fn process_streamed_welcome_message(
         &self,
         envelope_bytes: Vec<u8>,
-    ) -> Result<MlsGroup<Self>> {
+    ) -> Result<MlsGroup<ApiClient, Db>> {
         let provider = self.mls_provider();
         let conn = provider.db();
         let envelope =
@@ -223,7 +218,7 @@ where
         let known_welcomes = HashSet::from_iter(conn.group_welcome_ids()?.into_iter());
         let future = ProcessWelcomeFuture::new(
             known_welcomes,
-            self.clone(),
+            self.context.clone(),
             WelcomeOrGroup::Welcome(envelope),
             None,
         )?;
@@ -240,11 +235,23 @@ where
     pub async fn stream_conversations(
         &self,
         conversation_type: Option<ConversationType>,
-    ) -> Result<impl Stream<Item = Result<MlsGroup<Self>>> + use<'_, ApiClient, Db>>
+    ) -> Result<impl Stream<Item = Result<MlsGroup<ApiClient, Db>>> + use<'_, ApiClient, Db>>
     where
         ApiClient: XmtpMlsStreams,
     {
-        StreamConversations::new(self, conversation_type).await
+        StreamConversations::new(&self.context, conversation_type).await
+    }
+
+    /// Stream conversations but decouple the lifetime of 'self' from the stream.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn stream_conversations_owned(
+        &self,
+        conversation_type: Option<ConversationType>,
+    ) -> Result<impl Stream<Item = Result<MlsGroup<ApiClient, Db>>> + 'static>
+    where
+        ApiClient: XmtpMlsStreams,
+    {
+        StreamConversations::new_owned(self.context.clone(), conversation_type).await
     }
 }
 
@@ -256,10 +263,13 @@ where
     pub fn stream_conversations_with_callback(
         client: Arc<Client<ApiClient, Db>>,
         conversation_type: Option<ConversationType>,
-        #[cfg(not(target_arch = "wasm32"))] mut convo_callback: impl FnMut(Result<MlsGroup<Self>>)
+        #[cfg(not(target_arch = "wasm32"))] mut convo_callback: impl FnMut(Result<MlsGroup<ApiClient, Db>>)
             + Send
             + 'static,
-        #[cfg(target_arch = "wasm32")] mut convo_callback: impl FnMut(Result<MlsGroup<Self>>) + 'static,
+        #[cfg(target_arch = "wasm32")] mut convo_callback: impl FnMut(Result<MlsGroup<ApiClient, Db>>)
+            + 'static,
+        #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
+        #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
     ) -> impl StreamHandle<StreamOutput = Result<()>> {
         let (tx, rx) = oneshot::channel();
 
@@ -271,6 +281,7 @@ where
                 convo_callback(convo)
             }
             tracing::debug!("`stream_conversations` stream ended, dropping stream");
+            on_close();
             Ok::<_, SubscribeError>(())
         })
     }
@@ -288,7 +299,23 @@ where
             "stream all messages"
         );
 
-        StreamAllMessages::new(self, conversation_type, consent_state).await
+        StreamAllMessages::new(&self.context, conversation_type, consent_state).await
+    }
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn stream_all_messages_owned(
+        &self,
+        conversation_type: Option<ConversationType>,
+        consent_state: Option<Vec<ConsentState>>,
+    ) -> Result<impl Stream<Item = Result<StoredGroupMessage>> + 'static> {
+        tracing::debug!(
+            inbox_id = self.inbox_id(),
+            installation_id = %self.context().installation_public_key(),
+            conversation_type = ?conversation_type,
+            "stream all messages"
+        );
+
+        StreamAllMessages::new_owned(self.context.clone(), conversation_type, consent_state).await
     }
 
     pub fn stream_all_messages_with_callback(
@@ -299,6 +326,8 @@ where
             + Send
             + 'static,
         #[cfg(target_arch = "wasm32")] mut callback: impl FnMut(Result<StoredGroupMessage>) + 'static,
+        #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
+        #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
     ) -> impl StreamHandle<StreamOutput = Result<()>> {
         let (tx, rx) = oneshot::channel();
 
@@ -313,6 +342,7 @@ where
                 callback(message)
             }
             tracing::debug!("`stream_all_messages` stream ended, dropping stream");
+            on_close();
             Ok::<_, SubscribeError>(())
         })
     }
@@ -324,6 +354,8 @@ where
             + 'static,
         #[cfg(target_arch = "wasm32")] mut callback: impl FnMut(Result<Vec<StoredConsentRecord>>)
             + 'static,
+        #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
+        #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
     ) -> impl StreamHandle<StreamOutput = Result<()>> {
         let (tx, rx) = oneshot::channel();
 
@@ -337,6 +369,7 @@ where
                 callback(message)
             }
             tracing::debug!("`stream_consent` stream ended, dropping stream");
+            on_close();
             Ok::<_, SubscribeError>(())
         })
     }
@@ -347,6 +380,8 @@ where
             + Send
             + 'static,
         #[cfg(target_arch = "wasm32")] mut callback: impl FnMut(Result<Vec<PreferenceUpdate>>) + 'static,
+        #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
+        #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
     ) -> impl StreamHandle<StreamOutput = Result<()>> {
         let (tx, rx) = oneshot::channel();
 
@@ -360,6 +395,7 @@ where
                 callback(message)
             }
             tracing::debug!("`stream_consent` stream ended, dropping stream");
+            on_close();
             Ok::<_, SubscribeError>(())
         })
     }

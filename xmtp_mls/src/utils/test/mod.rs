@@ -3,8 +3,12 @@
 #[cfg(any(test, feature = "test-utils"))]
 pub mod tester_utils;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod fixtures;
+
 use crate::{
     builder::{ClientBuilder, SyncWorkerMode},
+    context::XmtpContextProvider,
     identity::IdentityStrategy,
     Client, InboxOwner, XmtpApi,
 };
@@ -26,6 +30,8 @@ pub use tester_utils::*;
 
 pub type FullXmtpClient = Client<TestClient>;
 
+pub type ConcreteMlsGroup = crate::groups::MlsGroup<TestClient, xmtp_db::DefaultStore>;
+
 #[cfg(not(any(feature = "http-api", target_arch = "wasm32")))]
 pub type TestClient = xmtp_api_grpc::grpc_api_helper::Client;
 
@@ -36,6 +42,8 @@ use crate::groups::mls_sync::GroupMessageProcessingError::OpenMlsProcessMessage;
     not(feature = "d14n")
 ))]
 use xmtp_api_http::XmtpHttpApiClient;
+
+use super::VersionInfo;
 
 #[cfg(all(
     any(feature = "http-api", target_arch = "wasm32"),
@@ -53,7 +61,18 @@ impl<A> ClientBuilder<A> {
 }
 
 impl ClientBuilder<TestClient> {
-    pub async fn new_api_client() -> TestClient {
+    pub fn local_port() -> &'static str {
+        <TestClient as XmtpTestClient>::local_port()
+    }
+
+    pub async fn new_custom_api_client(addr: &str) -> TestClient {
+        <TestClient as XmtpTestClient>::create_custom(addr)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    pub async fn new_localhost_api_client() -> TestClient {
         <TestClient as XmtpTestClient>::create_local()
             .build()
             .await
@@ -61,7 +80,7 @@ impl ClientBuilder<TestClient> {
     }
 
     pub async fn new_test_client(owner: &impl InboxOwner) -> FullXmtpClient {
-        let api_client = Self::new_api_client().await;
+        let api_client = Self::new_localhost_api_client().await;
 
         build_with_verifier(
             owner,
@@ -69,11 +88,32 @@ impl ClientBuilder<TestClient> {
             MockSmartContractSignatureVerifier::new(true),
             Some(crate::configuration::DeviceSyncUrls::LOCAL_ADDRESS),
             None,
+            None,
+            None,
         )
         .await
     }
 
-    pub async fn new_test_client_no_sync(owner: &impl InboxOwner) -> FullXmtpClient {
+    /// Test client without anything extra
+    pub async fn new_test_client_vanilla(owner: &impl InboxOwner) -> FullXmtpClient {
+        let api_client = Self::new_localhost_api_client().await;
+
+        build_with_verifier(
+            owner,
+            api_client,
+            MockSmartContractSignatureVerifier::new(true),
+            None,
+            Some(SyncWorkerMode::Disabled),
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_test_client_with_version(
+        owner: &impl InboxOwner,
+        version: VersionInfo,
+    ) -> FullXmtpClient {
         let api_client = <TestClient as XmtpTestClient>::create_local()
             .build()
             .await
@@ -85,6 +125,8 @@ impl ClientBuilder<TestClient> {
             MockSmartContractSignatureVerifier::new(true),
             None,
             Some(SyncWorkerMode::Disabled),
+            Some(version),
+            None,
         )
         .await
     }
@@ -99,6 +141,8 @@ impl ClientBuilder<TestClient> {
             owner,
             api_client,
             MockSmartContractSignatureVerifier::new(true),
+            None,
+            None,
             None,
             None,
         )
@@ -120,6 +164,8 @@ impl ClientBuilder<TestClient> {
             MockSmartContractSignatureVerifier::new(true),
             Some(history_sync_url),
             None,
+            None,
+            None,
         )
         .await
     }
@@ -135,6 +181,8 @@ impl ClientBuilder<TestClient> {
             owner,
             api_client,
             MockSmartContractSignatureVerifier::new(true),
+            None,
+            None,
             None,
             None,
         )
@@ -214,6 +262,8 @@ async fn build_with_verifier<A, V>(
     scw_verifier: V,
     sync_server_url: Option<&str>,
     sync_worker_mode: Option<SyncWorkerMode>,
+    version: Option<VersionInfo>,
+    disable_events: Option<bool>,
 ) -> Client<A>
 where
     A: XmtpApi + Send + Sync + 'static,
@@ -227,7 +277,13 @@ where
         .temp_store()
         .await
         .api_client(api_client)
+        // Anything that tests events should use the tester! macro.
+        .with_disable_events(disable_events)
         .with_scw_verifier(scw_verifier);
+
+    if let Some(v) = version {
+        builder = builder.version(v);
+    }
 
     if let Some(sync_server_url) = sync_server_url {
         builder = builder.device_sync_server_url(sync_server_url);
@@ -274,11 +330,12 @@ impl Delivery {
 impl<ApiClient, Db> Client<ApiClient, Db>
 where
     ApiClient: XmtpApi,
+    Db: XmtpDb,
 {
     pub async fn is_registered(&self, identifier: &Identifier) -> bool {
         let identifier: ApiIdentifier = identifier.into();
         let ids = self
-            .api_client
+            .api()
             .get_inbox_ids(vec![identifier.clone()])
             .await
             .unwrap();

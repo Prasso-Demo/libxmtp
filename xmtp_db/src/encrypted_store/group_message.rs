@@ -317,7 +317,57 @@ impl<C: ConnectionExt> DbConnection<C> {
             query = query.limit(limit);
         }
 
-        self.raw_query_read(|conn| query.load::<StoredGroupMessage>(conn))
+        let messages = self.raw_query_read(|conn| query.load::<StoredGroupMessage>(conn))?;
+
+        // Check if this is a DM group
+        let is_dm = self.raw_query_read(|conn| {
+            groups_dsl::groups
+                .filter(groups_dsl::id.eq(group_id))
+                .select(groups_dsl::conversation_type)
+                .first::<ConversationType>(conn)
+        })? == ConversationType::Dm;
+
+        // If DM, retain only one GroupUpdated message (the oldest)
+        let messages = if is_dm {
+            let mut grouped: Vec<StoredGroupMessage> = Vec::with_capacity(messages.len());
+            let mut oldest_group_updated: Option<StoredGroupMessage> = None;
+            let mut non_group_msgs: Vec<StoredGroupMessage> = Vec::new();
+
+            for msg in messages {
+                if msg.content_type == ContentType::GroupUpdated {
+                    if oldest_group_updated
+                        .as_ref()
+                        .map(|existing| msg.sent_at_ns < existing.sent_at_ns)
+                        .unwrap_or(true)
+                    {
+                        oldest_group_updated = Some(msg);
+                    }
+                } else {
+                    non_group_msgs.push(msg);
+                }
+            }
+
+            if let Some(msg) = oldest_group_updated {
+                match args.direction.as_ref().unwrap_or(&SortDirection::Ascending) {
+                    SortDirection::Ascending => {
+                        grouped.push(msg); // Add GroupUpdated at start
+                        grouped.extend(non_group_msgs);
+                    }
+                    SortDirection::Descending => {
+                        grouped.extend(non_group_msgs);
+                        grouped.push(msg); // Add GroupUpdated at end
+                    }
+                }
+            } else {
+                grouped = non_group_msgs;
+            }
+
+            grouped
+        } else {
+            messages
+        };
+
+        Ok(messages)
     }
 
     pub fn group_messages_paged(
@@ -469,6 +519,20 @@ impl<C: ConnectionExt> DbConnection<C> {
         })
     }
 
+    pub fn get_group_message_by_sequence_id<GroupId: AsRef<[u8]>>(
+        &self,
+        group_id: GroupId,
+        sequence_id: i64,
+    ) -> Result<Option<StoredGroupMessage>, crate::ConnectionError> {
+        self.raw_query_read(|conn| {
+            dsl::group_messages
+                .filter(dsl::group_id.eq(group_id.as_ref()))
+                .filter(dsl::sequence_id.eq(sequence_id))
+                .first(conn)
+                .optional()
+        })
+    }
+
     pub fn get_sync_group_messages(
         &self,
         group_id: &[u8],
@@ -487,6 +551,7 @@ impl<C: ConnectionExt> DbConnection<C> {
         &self,
         msg_id: &MessageId,
         timestamp: u64,
+        sequence_id: i64,
     ) -> Result<usize, crate::ConnectionError> {
         self.raw_query_write(|conn| {
             diesel::update(dsl::group_messages)
@@ -494,6 +559,7 @@ impl<C: ConnectionExt> DbConnection<C> {
                 .set((
                     dsl::delivery_status.eq(DeliveryStatus::Published),
                     dsl::sent_at_ns.eq(timestamp as i64),
+                    dsl::sequence_id.eq(sequence_id),
                 ))
                 .execute(conn)
         })

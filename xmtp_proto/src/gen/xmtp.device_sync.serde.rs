@@ -20,10 +20,13 @@ impl serde::Serialize for BackupElement {
                     struct_ser.serialize_field("group", v)?;
                 }
                 backup_element::Element::GroupMessage(v) => {
-                    struct_ser.serialize_field("groupMessage", v)?;
+                    struct_ser.serialize_field("group_message", v)?;
                 }
                 backup_element::Element::Consent(v) => {
                     struct_ser.serialize_field("consent", v)?;
+                }
+                backup_element::Element::Event(v) => {
+                    struct_ser.serialize_field("event", v)?;
                 }
             }
         }
@@ -42,6 +45,7 @@ impl<'de> serde::Deserialize<'de> for BackupElement {
             "group_message",
             "groupMessage",
             "consent",
+            "event",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -50,6 +54,8 @@ impl<'de> serde::Deserialize<'de> for BackupElement {
             Group,
             GroupMessage,
             Consent,
+            Event,
+            __SkipField__,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -75,7 +81,8 @@ impl<'de> serde::Deserialize<'de> for BackupElement {
                             "group" => Ok(GeneratedField::Group),
                             "groupMessage" | "group_message" => Ok(GeneratedField::GroupMessage),
                             "consent" => Ok(GeneratedField::Consent),
-                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                            "event" => Ok(GeneratedField::Event),
+                            _ => Ok(GeneratedField::__SkipField__),
                         }
                     }
                 }
@@ -125,6 +132,16 @@ impl<'de> serde::Deserialize<'de> for BackupElement {
                             element__ = map_.next_value::<::std::option::Option<_>>()?.map(backup_element::Element::Consent)
 ;
                         }
+                        GeneratedField::Event => {
+                            if element__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("event"));
+                            }
+                            element__ = map_.next_value::<::std::option::Option<_>>()?.map(backup_element::Element::Event)
+;
+                        }
+                        GeneratedField::__SkipField__ => {
+                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
+                        }
                     }
                 }
                 Ok(BackupElement {
@@ -145,6 +162,7 @@ impl serde::Serialize for BackupElementSelection {
             Self::Unspecified => "BACKUP_ELEMENT_SELECTION_UNSPECIFIED",
             Self::Messages => "BACKUP_ELEMENT_SELECTION_MESSAGES",
             Self::Consent => "BACKUP_ELEMENT_SELECTION_CONSENT",
+            Self::Event => "BACKUP_ELEMENT_SELECTION_EVENT",
         };
         serializer.serialize_str(variant)
     }
@@ -159,6 +177,7 @@ impl<'de> serde::Deserialize<'de> for BackupElementSelection {
             "BACKUP_ELEMENT_SELECTION_UNSPECIFIED",
             "BACKUP_ELEMENT_SELECTION_MESSAGES",
             "BACKUP_ELEMENT_SELECTION_CONSENT",
+            "BACKUP_ELEMENT_SELECTION_EVENT",
         ];
 
         struct GeneratedVisitor;
@@ -202,6 +221,7 @@ impl<'de> serde::Deserialize<'de> for BackupElementSelection {
                     "BACKUP_ELEMENT_SELECTION_UNSPECIFIED" => Ok(BackupElementSelection::Unspecified),
                     "BACKUP_ELEMENT_SELECTION_MESSAGES" => Ok(BackupElementSelection::Messages),
                     "BACKUP_ELEMENT_SELECTION_CONSENT" => Ok(BackupElementSelection::Consent),
+                    "BACKUP_ELEMENT_SELECTION_EVENT" => Ok(BackupElementSelection::Event),
                     _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
                 }
             }
@@ -240,17 +260,17 @@ impl serde::Serialize for BackupMetadataSave {
         if self.exported_at_ns != 0 {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("exportedAtNs", ToString::to_string(&self.exported_at_ns).as_str())?;
+            struct_ser.serialize_field("exported_at_ns", ToString::to_string(&self.exported_at_ns).as_str())?;
         }
         if let Some(v) = self.start_ns.as_ref() {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("startNs", ToString::to_string(&v).as_str())?;
+            struct_ser.serialize_field("start_ns", ToString::to_string(&v).as_str())?;
         }
         if let Some(v) = self.end_ns.as_ref() {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("endNs", ToString::to_string(&v).as_str())?;
+            struct_ser.serialize_field("end_ns", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -277,6 +297,7 @@ impl<'de> serde::Deserialize<'de> for BackupMetadataSave {
             ExportedAtNs,
             StartNs,
             EndNs,
+            __SkipField__,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -302,7 +323,7 @@ impl<'de> serde::Deserialize<'de> for BackupMetadataSave {
                             "exportedAtNs" | "exported_at_ns" => Ok(GeneratedField::ExportedAtNs),
                             "startNs" | "start_ns" => Ok(GeneratedField::StartNs),
                             "endNs" | "end_ns" => Ok(GeneratedField::EndNs),
-                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                            _ => Ok(GeneratedField::__SkipField__),
                         }
                     }
                 }
@@ -357,6 +378,9 @@ impl<'de> serde::Deserialize<'de> for BackupMetadataSave {
                                 map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
                             ;
                         }
+                        GeneratedField::__SkipField__ => {
+                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
+                        }
                     }
                 }
                 Ok(BackupMetadataSave {
@@ -398,12 +422,12 @@ impl serde::Serialize for BackupOptions {
         if let Some(v) = self.start_ns.as_ref() {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("startNs", ToString::to_string(&v).as_str())?;
+            struct_ser.serialize_field("start_ns", ToString::to_string(&v).as_str())?;
         }
         if let Some(v) = self.end_ns.as_ref() {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("endNs", ToString::to_string(&v).as_str())?;
+            struct_ser.serialize_field("end_ns", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -427,6 +451,7 @@ impl<'de> serde::Deserialize<'de> for BackupOptions {
             Elements,
             StartNs,
             EndNs,
+            __SkipField__,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -451,7 +476,7 @@ impl<'de> serde::Deserialize<'de> for BackupOptions {
                             "elements" => Ok(GeneratedField::Elements),
                             "startNs" | "start_ns" => Ok(GeneratedField::StartNs),
                             "endNs" | "end_ns" => Ok(GeneratedField::EndNs),
-                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                            _ => Ok(GeneratedField::__SkipField__),
                         }
                     }
                 }
@@ -496,6 +521,9 @@ impl<'de> serde::Deserialize<'de> for BackupOptions {
                             end_ns__ = 
                                 map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
                             ;
+                        }
+                        GeneratedField::__SkipField__ => {
+                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
                         }
                     }
                 }

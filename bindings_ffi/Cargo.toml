@@ -4,6 +4,9 @@ name = "xmtpv3"
 version.workspace = true
 license.workspace = true
 
+[lints.clippy]
+uninlined_format_args = "allow"
+
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
 
@@ -40,7 +43,7 @@ fdlimit = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 paranoid-android = "0.2"
-tracing_android_trace = { version = "0.1", features = ["api_level_29"] }
+tracing_android_trace = "0.1"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 tracing-oslog = "0.2"
@@ -55,20 +58,20 @@ path = "bindgen/bin.rs"
 required-features = ["uniffi/cli"]
 
 [dev-dependencies]
-ethers = { workspace = true, features = ["rustls"] }
+alloy.workspace = true
+async-trait.workspace = true
+chrono = { workspace = true }
+ctor.workspace = true
+fdlimit = { workspace = true }
 rand.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 uniffi = { version = "0.29.0", features = ["bindgen-tests"] }
 uuid = { workspace = true, features = ["v4", "fast-rng"] }
 xmtp_api_grpc = { workspace = true, features = ["test-utils"] }
-xmtp_mls = { workspace = true, features = ["test-utils"] }
-xmtp_db = { workspace = true, features = ["test-utils"] }
-xmtp_proto = { workspace = true, features = ["test-utils"] }
 xmtp_common = { workspace = true, features = ["test-utils"] }
-chrono = { workspace = true }
-async-trait.workspace = true
-fdlimit = { workspace = true }
-ctor.workspace = true
+xmtp_db = { workspace = true, features = ["test-utils"] }
+xmtp_mls = { workspace = true, features = ["test-utils"] }
+xmtp_proto = { workspace = true, features = ["test-utils"] }
 
 [features]
 bench = ["xmtp_mls/bench", "xmtp_common/bench", "dep:criterion", "dep:fdlimit"]

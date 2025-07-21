@@ -9,7 +9,7 @@ use super::{
         processed_device_sync_messages::{self, dsl},
     },
 };
-use crate::{StorageError, impl_store};
+use crate::{StorageError, impl_store, impl_store_or_ignore};
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,10 @@ pub struct StoredProcessedDeviceSyncMessages {
 }
 
 impl_store!(
+    StoredProcessedDeviceSyncMessages,
+    processed_device_sync_messages
+);
+impl_store_or_ignore!(
     StoredProcessedDeviceSyncMessages,
     processed_device_sync_messages
 );
@@ -52,7 +56,7 @@ mod tests {
         test_utils::with_connection,
     };
 
-    #[xmtp_common::test(unwrap_try = "true")]
+    #[xmtp_common::test(unwrap_try = true)]
     async fn it_marks_as_processed() {
         with_connection(|conn| {
             let mut group = generate_group(None);

@@ -1,3 +1,14 @@
+use super::{
+    group_membership::GroupMembership,
+    group_permissions::{MembershipPolicies, MetadataPolicies, PermissionsPolicies},
+    mls_ext::{WrapperAlgorithm, WrapperEncryptionExtension},
+    GroupError, MlsGroup,
+};
+use crate::{
+    configuration::GROUP_KEY_ROTATION_INTERVAL_NS,
+    track,
+    verified_key_package_v2::{KeyPackageVerificationError, VerifiedKeyPackageV2},
+};
 use openmls::prelude::{
     tls_codec::{Error as TlsCodecError, Serialize},
     MlsMessageOut,
@@ -5,7 +16,14 @@ use openmls::prelude::{
 use prost::{bytes::Bytes, DecodeError, Message};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
-
+use xmtp_api::XmtpApi;
+use xmtp_common::types::Address;
+use xmtp_db::{
+    db_connection::DbConnection,
+    group_intent::{IntentKind, NewGroupIntent, StoredGroupIntent},
+    MlsProviderExt, XmtpDb,
+};
+use xmtp_mls_common::group_mutable_metadata::MetadataField;
 use xmtp_proto::xmtp::mls::database::{
     addresses_or_installation_ids::AddressesOrInstallationIds as AddressesOrInstallationIdsProto,
     post_commit_action::{
@@ -24,23 +42,6 @@ use xmtp_proto::xmtp::mls::database::{
     UpdateAdminListsData, UpdateGroupMembershipData, UpdateMetadataData, UpdatePermissionData,
 };
 
-use super::{
-    group_membership::GroupMembership,
-    group_mutable_metadata::MetadataField,
-    group_permissions::{MembershipPolicies, MetadataPolicies, PermissionsPolicies},
-    scoped_client::ScopedGroupClient,
-    GroupError, MlsGroup,
-};
-use crate::{
-    configuration::GROUP_KEY_ROTATION_INTERVAL_NS,
-    verified_key_package_v2::{KeyPackageVerificationError, VerifiedKeyPackageV2},
-};
-use xmtp_common::types::Address;
-use xmtp_db::{
-    db_connection::DbConnection,
-    group_intent::{IntentKind, NewGroupIntent, StoredGroupIntent},
-    MlsProviderExt, XmtpDb,
-};
 #[derive(Debug, Error)]
 pub enum IntentError {
     #[error("decode error: {0}")]
@@ -69,14 +70,19 @@ pub enum IntentError {
     UnknownAdminListAction,
 }
 
-impl<ScopedClient: ScopedGroupClient> MlsGroup<ScopedClient> {
+impl<ApiClient, Db> MlsGroup<ApiClient, Db>
+where
+    ApiClient: XmtpApi,
+    Db: XmtpDb,
+{
     pub fn queue_intent(
         &self,
         intent_kind: IntentKind,
         intent_data: Vec<u8>,
         should_push: bool,
     ) -> Result<StoredGroupIntent, GroupError> {
-        let res = self.mls_provider().transaction(|provider| {
+        let provider = self.mls_provider();
+        let res = provider.transaction(|provider| {
             let conn = provider.db();
             self.queue_intent_with_conn(conn, intent_kind, intent_data, should_push)
         });
@@ -86,13 +92,13 @@ impl<ScopedClient: ScopedGroupClient> MlsGroup<ScopedClient> {
 
     fn queue_intent_with_conn(
         &self,
-        conn: &DbConnection<<<ScopedClient as ScopedGroupClient>::Db as XmtpDb>::Connection>,
+        conn: &DbConnection<<Db as XmtpDb>::Connection>,
         intent_kind: IntentKind,
         intent_data: Vec<u8>,
         should_push: bool,
     ) -> Result<StoredGroupIntent, GroupError> {
         if intent_kind == IntentKind::SendMessage {
-            self.maybe_insert_key_update_intent()?;
+            self.maybe_insert_key_update_intent(conn)?;
         }
 
         let intent = conn.insert_group_intent(NewGroupIntent::new(
@@ -104,15 +110,23 @@ impl<ScopedClient: ScopedGroupClient> MlsGroup<ScopedClient> {
 
         if intent_kind != IntentKind::SendMessage {
             conn.update_rotated_at_ns(self.group_id.clone())?;
+
+            track!(
+                "Queue Intent",
+                { "intent_kind": intent_kind },
+                group: &self.group_id
+            );
         }
-        tracing::debug!(inbox_id = self.client.inbox_id(), intent_kind = %intent_kind, "queued intent");
+        tracing::debug!(inbox_id = self.context.inbox_id(), intent_kind = %intent_kind, "queued intent");
 
         Ok(intent)
     }
 
-    fn maybe_insert_key_update_intent(&self) -> Result<(), GroupError> {
-        let provider = self.mls_provider();
-        let conn = provider.db();
+    #[tracing::instrument(level = "debug", skip_all)]
+    fn maybe_insert_key_update_intent(
+        &self,
+        conn: &DbConnection<<Db as XmtpDb>::Connection>,
+    ) -> Result<(), GroupError> {
         let last_rotated_at_ns = conn.get_rotated_at_ns(self.group_id.clone())?;
         let now_ns = xmtp_common::time::now_ns();
         let elapsed_ns = now_ns - last_rotated_at_ns;
@@ -684,14 +698,27 @@ pub enum PostCommitAction {
 pub struct Installation {
     pub(crate) installation_key: Vec<u8>,
     pub(crate) hpke_public_key: Vec<u8>,
+    pub(crate) welcome_wrapper_algorithm: WrapperAlgorithm,
 }
 
 impl Installation {
-    pub fn from_verified_key_package(key_package: &VerifiedKeyPackageV2) -> Self {
-        Self {
+    pub fn from_verified_key_package(
+        key_package: &VerifiedKeyPackageV2,
+    ) -> Result<Self, IntentError> {
+        let wrapper_encryption = key_package.wrapper_encryption()?.unwrap_or_else(|| {
+            // Default to using the hpke init key as the pub key and Curve25519 as the algorithm
+            // if no extension is present. This means you are on an older key package
+            WrapperEncryptionExtension::new(
+                WrapperAlgorithm::Curve25519,
+                key_package.hpke_init_key(),
+            )
+        });
+
+        Ok(Self {
             installation_key: key_package.installation_id(),
-            hpke_public_key: key_package.hpke_init_key(),
-        }
+            hpke_public_key: wrapper_encryption.pub_key_bytes,
+            welcome_wrapper_algorithm: wrapper_encryption.algorithm,
+        })
     }
 }
 
@@ -700,6 +727,7 @@ impl From<Installation> for InstallationProto {
         Self {
             installation_key: installation.installation_key,
             hpke_public_key: installation.hpke_public_key,
+            welcome_wrapper_algorithm: installation.welcome_wrapper_algorithm.into(),
         }
     }
 }
@@ -709,6 +737,7 @@ impl From<InstallationProto> for Installation {
         Self {
             installation_key: installation.installation_key,
             hpke_public_key: installation.hpke_public_key,
+            welcome_wrapper_algorithm: installation.welcome_wrapper_algorithm.into(),
         }
     }
 }
@@ -791,11 +820,10 @@ pub(crate) mod tests {
     use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent};
     use tls_codec::Deserialize;
     use xmtp_cryptography::utils::generate_local_wallet;
+
     use xmtp_proto::xmtp::mls::api::v1::{group_message, GroupMessage};
 
-    use crate::{
-        builder::ClientBuilder, groups::GroupMetadataOptions, utils::test::FullXmtpClient,
-    };
+    use crate::{builder::ClientBuilder, context::XmtpContextProvider, utils::ConcreteMlsGroup};
 
     use super::*;
 
@@ -856,9 +884,7 @@ pub(crate) mod tests {
         let client_b = ClientBuilder::new_test_client(&generate_local_wallet()).await;
 
         // client A makes a group with client B, and then sends a message to client B.
-        let group_a = client_a
-            .create_group(None, GroupMetadataOptions::default())
-            .expect("create group");
+        let group_a = client_a.create_group(None, None).expect("create group");
         group_a
             .add_members_by_inbox_id(&[client_b.inbox_id()])
             .await
@@ -905,11 +931,11 @@ pub(crate) mod tests {
     }
 
     async fn verify_num_payloads_in_group(
-        group: &MlsGroup<FullXmtpClient>,
+        group: &ConcreteMlsGroup,
         num_messages: usize,
     ) -> Vec<GroupMessage> {
         let messages = group
-            .client
+            .context
             .api()
             .query_group_messages(group.group_id.clone(), None)
             .await
@@ -918,7 +944,7 @@ pub(crate) mod tests {
         messages
     }
 
-    fn verify_commit_updates_leaf_node(group: &MlsGroup<FullXmtpClient>, payload: &GroupMessage) {
+    fn verify_commit_updates_leaf_node(group: &ConcreteMlsGroup, payload: &GroupMessage) {
         let msgv1 = match &payload.version {
             Some(group_message::Version::V1(value)) => value,
             _ => panic!("error msgv1"),
@@ -930,10 +956,12 @@ pub(crate) mod tests {
             _ => panic!("error mls_message"),
         };
 
-        let provider = group.client.mls_provider();
+        let provider = group.context.mls_provider();
         let decrypted_message = group
             .load_mls_group_with_lock(&provider, |mut mls_group| {
-                Ok(mls_group.process_message(&provider, mls_message).unwrap())
+                Ok(mls_group
+                    .process_message(&provider, mls_message.clone())
+                    .unwrap())
             })
             .unwrap();
 

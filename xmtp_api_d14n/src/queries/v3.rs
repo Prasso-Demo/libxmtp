@@ -140,6 +140,28 @@ where
             .await
     }
 
+    async fn publish_commit_log(
+        &self,
+        request: mls_v1::BatchPublishCommitLogRequest,
+    ) -> Result<(), Self::Error> {
+        PublishCommitLog::builder()
+            .commit_log_entries(request.requests)
+            .build()?
+            .query(&self.client)
+            .await
+    }
+
+    async fn query_commit_log(
+        &self,
+        request: mls_v1::BatchQueryCommitLogRequest,
+    ) -> Result<mls_v1::BatchQueryCommitLogResponse, Self::Error> {
+        QueryCommitLog::builder()
+            .query_log_requests(request.requests)
+            .build()?
+            .query(&self.client)
+            .await
+    }
+
     fn stats(&self) -> ApiStats {
         Default::default()
     }
@@ -229,38 +251,29 @@ where
     type Error = ApiClientError<E>;
 
     #[cfg(not(target_arch = "wasm32"))]
-    type GroupMessageStream<'a>
-        = stream::BoxStream<'a, Result<mls_v1::GroupMessage, Self::Error>>
-    where
-        C: 'a;
+    type GroupMessageStream = stream::BoxStream<'static, Result<mls_v1::GroupMessage, Self::Error>>;
     #[cfg(not(target_arch = "wasm32"))]
-    type WelcomeMessageStream<'a>
-        = stream::BoxStream<'a, Result<mls_v1::WelcomeMessage, Self::Error>>
-    where
-        C: 'a;
+    type WelcomeMessageStream =
+        stream::BoxStream<'static, Result<mls_v1::WelcomeMessage, Self::Error>>;
 
     #[cfg(target_arch = "wasm32")]
-    type GroupMessageStream<'a>
-        = stream::LocalBoxStream<'a, Result<mls_v1::GroupMessage, Self::Error>>
-    where
-        C: 'a;
+    type GroupMessageStream =
+        stream::LocalBoxStream<'static, Result<mls_v1::GroupMessage, Self::Error>>;
     #[cfg(target_arch = "wasm32")]
-    type WelcomeMessageStream<'a>
-        = stream::LocalBoxStream<'a, Result<mls_v1::WelcomeMessage, Self::Error>>
-    where
-        C: 'a;
+    type WelcomeMessageStream =
+        stream::LocalBoxStream<'static, Result<mls_v1::WelcomeMessage, Self::Error>>;
 
     async fn subscribe_group_messages(
         &self,
         _request: mls_v1::SubscribeGroupMessagesRequest,
-    ) -> Result<Self::GroupMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::GroupMessageStream, Self::Error> {
         todo!()
     }
 
     async fn subscribe_welcome_messages(
         &self,
         _request: mls_v1::SubscribeWelcomeMessagesRequest,
-    ) -> Result<Self::WelcomeMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::WelcomeMessageStream, Self::Error> {
         todo!()
     }
 }

@@ -5,9 +5,11 @@ use xmtp_db::XmtpDb;
 use xmtp_id::scw_verifier::SmartContractSignatureVerifier;
 
 use crate::{
-    groups::{DMMetadataOptions, GroupError, MlsGroup},
+    groups::{GroupError, MlsGroup},
     Client,
 };
+
+use super::group_test_utils::TestError;
 
 // Please ensure that all public functions defined in this module
 // start with `test_`
@@ -21,7 +23,7 @@ where
     pub async fn test_talk_in_dm_with(
         &self,
         other: &Self,
-    ) -> Result<(MlsGroup<Self>, String), GroupError> {
+    ) -> Result<(MlsGroup<ApiClient, Db>, String), TestError> {
         self.sync_welcomes().await?;
         let dm = self
             .find_or_create_dm_by_inbox_id(other.inbox_id(), None)
@@ -44,12 +46,13 @@ where
     pub async fn test_has_same_sync_group_as(&self, other: &Self) -> Result<(), GroupError> {
         self.sync_welcomes().await?;
         other.sync_welcomes().await?;
-
-        let mut sync_group = self.get_sync_group().await?;
-        let mut other_sync_group = other.get_sync_group().await?;
+        let this_sync = self.device_sync_client();
+        let other_sync = other.device_sync_client();
+        let mut sync_group = this_sync.get_sync_group().await?;
+        let mut other_sync_group = other_sync.get_sync_group().await?;
         for i in 0..10 {
-            sync_group = self.get_sync_group().await?;
-            other_sync_group = other.get_sync_group().await?;
+            sync_group = this_sync.get_sync_group().await?;
+            other_sync_group = other_sync.get_sync_group().await?;
 
             sync_group.sync().await?;
             other_sync_group.sync().await?;

@@ -4,6 +4,9 @@ license.workspace = true
 name = "xmtp_proto"
 version.workspace = true
 
+[lints.clippy]
+uninlined_format_args = "allow"
+
 [dependencies]
 async-trait.workspace = true
 derive_builder.workspace = true
@@ -54,6 +57,7 @@ proto_full = [
   "xmtp-device_sync",
   "xmtp-device_sync-consent_backup",
   "xmtp-device_sync-content",
+  "xmtp-device_sync-event_backup",
   "xmtp-device_sync-group_backup",
   "xmtp-device_sync-message_backup",
   "xmtp-identity",
@@ -74,6 +78,7 @@ proto_full = [
 ]
 "xmtp-device_sync" = [
   "xmtp-device_sync-consent_backup",
+  "xmtp-device_sync-event_backup",
   "xmtp-device_sync-group_backup",
   "xmtp-device_sync-message_backup",
 ]
@@ -82,6 +87,7 @@ proto_full = [
   "xmtp-device_sync",
   "xmtp-device_sync-consent_backup",
 ]
+"xmtp-device_sync-event_backup" = ["xmtp-device_sync"]
 "xmtp-device_sync-group_backup" = ["xmtp-device_sync"]
 "xmtp-device_sync-message_backup" = ["xmtp-device_sync"]
 "xmtp-identity" = []
@@ -90,7 +96,7 @@ proto_full = [
 "xmtp-keystore_api-v1" = ["xmtp-message_contents"]
 "xmtp-message_api-v1" = ["xmtp-message_contents"]
 "xmtp-message_contents" = []
-"xmtp-mls-api-v1" = ["xmtp-message_contents"]
+"xmtp-mls-api-v1" = ["xmtp-message_contents", "xmtp-mls-message_contents"]
 "xmtp-mls-database" = []
 "xmtp-mls-message_contents" = []
 "xmtp-mls-message_contents-content_types" = ["xmtp-mls-message_contents"]

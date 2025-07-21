@@ -4,10 +4,14 @@ edition = "2021"
 license.workspace = true
 version.workspace = true
 
+[lints.clippy]
+uninlined_format_args = "allow"
+
 [dependencies]
 async-trait.workspace = true
 futures = { workspace = true }
 hex.workspace = true
+prost = { workspace = true, features = ["prost-derive"] }
 thiserror.workspace = true
 tracing.workspace = true
 xmtp_api_http = { workspace = true, optional = true, features = ["test-utils"] }
@@ -24,6 +28,7 @@ xmtp_api_grpc = { workspace = true, optional = true, features = ["test-utils"] }
 
 # test utils
 [dev-dependencies]
+futures-timer.workspace = true
 mockall.workspace = true
 xmtp_common = { workspace = true, features = ["test-utils"] }
 xmtp_id = { workspace = true, features = ["test-utils"] }
@@ -32,6 +37,7 @@ xmtp_proto = { workspace = true, features = ["test-utils"] }
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 tokio = { workspace = true, features = ["rt"] }
 wasm-bindgen-test.workspace = true
+xmtp_api_http = { workspace = true, features = ["test-utils"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }

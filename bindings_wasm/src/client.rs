@@ -10,33 +10,30 @@ use wasm_bindgen::JsValue;
 use xmtp_api::ApiDebugWrapper;
 use xmtp_api_http::XmtpHttpApiClient;
 use xmtp_db::{EncryptedMessageStore, EncryptionKey, StorageOption, WasmDb};
-use xmtp_id::associations::builder::SignatureRequest;
 use xmtp_id::associations::Identifier as XmtpIdentifier;
 use xmtp_mls::builder::SyncWorkerMode;
+use xmtp_mls::groups::MlsGroup;
 use xmtp_mls::identity::IdentityStrategy;
+use xmtp_mls::utils::events::upload_debug_archive;
 use xmtp_mls::Client as MlsClient;
+use xmtp_proto::api_client::AggregateStats;
 
 use crate::conversations::Conversations;
-use crate::identity::Identifier;
+use crate::identity::{ApiStats, Identifier, IdentityStats};
 use crate::inbox_state::InboxState;
-use crate::signatures::SignatureRequestType;
 
 pub type RustXmtpClient = MlsClient<ApiDebugWrapper<XmtpHttpApiClient>>;
+pub type RustMlsGroup = MlsGroup<ApiDebugWrapper<XmtpHttpApiClient>, xmtp_db::DefaultStore>;
 
 #[wasm_bindgen]
 pub struct Client {
   account_identifier: Identifier,
   inner_client: Arc<RustXmtpClient>,
-  pub(crate) signature_requests: HashMap<SignatureRequestType, SignatureRequest>,
 }
 
 impl Client {
   pub fn inner_client(&self) -> &Arc<RustXmtpClient> {
     &self.inner_client
-  }
-
-  pub fn signature_requests(&self) -> &HashMap<SignatureRequestType, SignatureRequest> {
-    &self.signature_requests
   }
 }
 
@@ -148,6 +145,8 @@ pub async fn create_client(
   device_sync_server_url: Option<String>,
   device_sync_worker_mode: Option<DeviceSyncWorkerMode>,
   log_options: Option<LogOptions>,
+  allow_offline: Option<bool>,
+  disable_events: Option<bool>,
 ) -> Result<Client, JsError> {
   init_logging(log_options.unwrap_or_default())?;
   let api_client = XmtpHttpApiClient::new(host.clone(), "0.0.0".into()).await?;
@@ -187,12 +186,16 @@ pub async fn create_client(
       .api_client(api_client)
       .enable_api_debug_wrapper()?
       .with_remote_verifier()?
+      .with_allow_offline(allow_offline)
+      .with_disable_events(disable_events)
       .store(store)
       .device_sync_server_url(&url),
     None => xmtp_mls::Client::builder(identity_strategy)
       .api_client(api_client)
       .enable_api_debug_wrapper()?
       .with_remote_verifier()?
+      .with_allow_offline(allow_offline)
+      .with_disable_events(disable_events)
       .store(store),
   };
 
@@ -209,7 +212,6 @@ pub async fn create_client(
     account_identifier,
     #[allow(clippy::arc_with_non_send_sync)]
     inner_client: Arc::new(xmtp_client),
-    signature_requests: HashMap::new(),
   })
 }
 
@@ -267,36 +269,11 @@ impl Client {
     Ok(crate::to_value(&results)?)
   }
 
-  #[wasm_bindgen(js_name = registerIdentity)]
-  pub async fn register_identity(&mut self) -> Result<(), JsError> {
-    if self.is_registered() {
-      return Err(JsError::new(
-        "An identity is already registered with this client",
-      ));
-    }
-
-    let signature_request = self
-      .signature_requests
-      .get(&SignatureRequestType::CreateInbox)
-      .ok_or(JsError::new("No signature request found"))?
-      .clone();
-    self
-      .inner_client
-      .register_identity(signature_request)
-      .await
-      .map_err(|e| JsError::new(format!("{}", e).as_str()))?;
-
-    self
-      .signature_requests
-      .remove(&SignatureRequestType::CreateInbox);
-
-    Ok(())
-  }
-
   #[wasm_bindgen(js_name = sendSyncRequest)]
   pub async fn send_sync_request(&self) -> Result<(), JsError> {
     self
       .inner_client
+      .device_sync_client()
       .send_sync_request()
       .await
       .map_err(|e| JsError::new(format!("{}", e).as_str()))?;
@@ -348,12 +325,44 @@ impl Client {
     let num_groups_synced: usize = inner
       .sync_all_welcomes_and_history_sync_groups()
       .await
-      .map_err(|e| JsError::new(&format!("{}", e)))?;
+      .map_err(|e| JsError::new(&format!("{e}")))?;
 
     let num_groups_synced: u32 = num_groups_synced
       .try_into()
       .map_err(|_| JsError::new("Failed to convert usize to u32"))?;
 
     Ok(num_groups_synced)
+  }
+
+  #[wasm_bindgen(js_name = apiStatistics)]
+  pub fn api_statistics(&self) -> ApiStats {
+    self.inner_client.api_stats().into()
+  }
+
+  #[wasm_bindgen(js_name = apiIdentityStatistics)]
+  pub fn api_identity_statistics(&self) -> IdentityStats {
+    self.inner_client.identity_api_stats().into()
+  }
+
+  #[wasm_bindgen(js_name = apiAggregateStatistics)]
+  pub fn api_aggregate_statistics(&self) -> String {
+    let api = self.inner_client.api_stats();
+    let identity = self.inner_client.identity_api_stats();
+    let aggregate = AggregateStats { mls: api, identity };
+    format!("{:?}", aggregate)
+  }
+
+  #[wasm_bindgen(js_name = clearAllStatistics)]
+  pub fn clear_all_statistics(&self) {
+    self.inner_client.clear_stats()
+  }
+
+  #[wasm_bindgen(js_name = uploadDebugArchive)]
+  pub async fn upload_debug_archive(&self, server_url: String) -> Result<String, JsError> {
+    let provider = Arc::new(self.inner_client().mls_provider());
+
+    upload_debug_archive(&provider, Some(server_url))
+      .await
+      .map_err(|e| JsError::new(&format!("{e}")))
   }
 }

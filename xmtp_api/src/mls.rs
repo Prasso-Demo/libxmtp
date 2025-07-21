@@ -2,8 +2,13 @@ use std::collections::HashMap;
 
 use super::ApiClientWrapper;
 use crate::{Result, XmtpApi};
+use prost::Message;
 use xmtp_common::retry_async;
 use xmtp_proto::api_client::XmtpMlsStreams;
+use xmtp_proto::mls_v1::{
+    BatchPublishCommitLogRequest, BatchQueryCommitLogRequest, PublishCommitLogRequest,
+    QueryCommitLogRequest, QueryCommitLogResponse,
+};
 use xmtp_proto::xmtp::mls::api::v1::{
     subscribe_group_messages_request::Filter as GroupFilterProto,
     subscribe_welcome_messages_request::Filter as WelcomeFilterProto, FetchKeyPackagesRequest,
@@ -12,6 +17,7 @@ use xmtp_proto::xmtp::mls::api::v1::{
     SortDirection, SubscribeGroupMessagesRequest, SubscribeWelcomeMessagesRequest,
     UploadKeyPackageRequest, WelcomeMessage, WelcomeMessageInput,
 };
+use xmtp_proto::xmtp::mls::message_contents::PlaintextCommitLogEntry;
 // the max page size for queries
 const MAX_PAGE_SIZE: u32 = 100;
 
@@ -20,6 +26,15 @@ const MAX_PAGE_SIZE: u32 = 100;
 pub struct GroupFilter {
     pub group_id: Vec<u8>,
     pub id_cursor: Option<u64>,
+}
+
+impl std::fmt::Debug for GroupFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupFilter")
+            .field("group_id", &xmtp_common::fmt::debug_hex(&self.group_id))
+            .field("id_cursor", &self.id_cursor)
+            .finish()
+    }
 }
 
 impl GroupFilter {
@@ -316,7 +331,7 @@ where
     pub async fn subscribe_group_messages(
         &self,
         filters: Vec<GroupFilter>,
-    ) -> Result<<ApiClient as XmtpMlsStreams>::GroupMessageStream<'_>>
+    ) -> Result<<ApiClient as XmtpMlsStreams>::GroupMessageStream>
     where
         ApiClient: XmtpMlsStreams,
     {
@@ -333,7 +348,7 @@ where
         &self,
         installation_key: &[u8],
         id_cursor: Option<u64>,
-    ) -> Result<<ApiClient as XmtpMlsStreams>::WelcomeMessageStream<'_>>
+    ) -> Result<<ApiClient as XmtpMlsStreams>::WelcomeMessageStream>
     where
         ApiClient: XmtpMlsStreams,
     {
@@ -351,6 +366,46 @@ where
             .await
             .map_err(crate::dyn_err)
     }
+
+    pub async fn publish_commit_log(&self, commit_log: &[PlaintextCommitLogEntry]) -> Result<()> {
+        tracing::debug!(inbox_id = self.inbox_id, "publishing commit log");
+        self.api_client
+            .publish_commit_log(BatchPublishCommitLogRequest {
+                requests: commit_log
+                    .iter()
+                    .map(convert_plaintext_to_publish_request)
+                    .collect(),
+            })
+            .await
+            .map_err(crate::dyn_err)
+    }
+
+    pub async fn query_commit_log(
+        &self,
+        query_log_requests: Vec<QueryCommitLogRequest>,
+    ) -> Result<Vec<QueryCommitLogResponse>> {
+        tracing::debug!(inbox_id = self.inbox_id, "querying commit log");
+        let responses: Vec<QueryCommitLogResponse> = self
+            .api_client
+            .query_commit_log(BatchQueryCommitLogRequest {
+                requests: query_log_requests,
+            })
+            .await
+            .map_err(crate::dyn_err)?
+            .responses;
+
+        Ok(responses)
+    }
+}
+
+/// TODO(cvoell): Encrypt the commit log entry instead of just encoding to bytes
+pub fn convert_plaintext_to_publish_request(
+    entry: &PlaintextCommitLogEntry,
+) -> PublishCommitLogRequest {
+    PublishCommitLogRequest {
+        group_id: entry.group_id.clone(),
+        encrypted_commit_log_entry: entry.encode_to_vec(),
+    }
 }
 
 #[cfg(test)]
@@ -362,7 +417,12 @@ pub mod tests {
     use crate::*;
 
     use crate::test_utils::MockError;
+    use xmtp_common::rand_vec;
     use xmtp_proto::api_client::ApiBuilder;
+    use xmtp_proto::mls_v1::{
+        welcome_message_input::{Version as WelcomeVersion, V1 as WelcomeV1},
+        WelcomeMessageInput,
+    };
     use xmtp_proto::xmtp::mls::api::v1::{
         fetch_key_packages_response::KeyPackage, FetchKeyPackagesResponse, PagingInfo,
         QueryGroupMessagesResponse,
@@ -588,5 +648,44 @@ pub mod tests {
         let now = std::time::Instant::now();
         let _second = wrapper.query_group_messages(vec![0, 0], None).await;
         assert!(now.elapsed() > std::time::Duration::from_secs(60));
+    }
+
+    #[xmtp_common::test]
+    #[cfg_attr(any(feature = "http-api", target_arch = "wasm32"), ignore)]
+    async fn it_should_allow_large_payloads() {
+        let mut client = crate::tests::TestClient::builder();
+        client.set_host("http://localhost:5556".into());
+        client.set_tls(false);
+        client.set_app_version("0.0.0".into()).unwrap();
+        let installation_key = rand_vec::<32>();
+        let hpke_public_key = rand_vec::<32>();
+
+        let c = client.build().await.unwrap();
+        let wrapper = ApiClientWrapper::new(c, Retry::default());
+
+        let mut very_large_payload = vec![];
+        // rand_vec overflows over 1mb, so we break it up
+        for _ in 0..10 {
+            very_large_payload.extend(rand_vec::<900000>());
+        }
+
+        wrapper
+            .send_welcome_messages(&[WelcomeMessageInput {
+                version: Some(WelcomeVersion::V1(WelcomeV1 {
+                    installation_key: installation_key.clone(),
+                    data: very_large_payload,
+                    hpke_public_key: hpke_public_key.clone(),
+                    wrapper_algorithm: 0,
+                    welcome_metadata: Vec::new(),
+                })),
+            }])
+            .await
+            .unwrap();
+
+        let messages = wrapper
+            .query_welcome_messages(&installation_key, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1);
     }
 }

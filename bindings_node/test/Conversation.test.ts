@@ -43,7 +43,7 @@ describe.concurrent('Conversation', () => {
     expect(conversation2.id()).toBe(conversation.id())
     expect(conversation2.groupName()).toBe(newName)
     const messages2 = await conversation2.findMessages()
-    expect(messages2.length).toBe(1)
+    expect(messages2.length).toBe(2)
   })
 
   it('should update conversation image URL', async () => {
@@ -73,7 +73,7 @@ describe.concurrent('Conversation', () => {
     expect(conversation2.id()).toBe(conversation.id())
     expect(conversation2.groupImageUrlSquare()).toBe(imageUrl)
     const messages2 = await conversation2.findMessages()
-    expect(messages2.length).toBe(1)
+    expect(messages2.length).toBe(2)
   })
 
   it('should update conversation description', async () => {
@@ -103,7 +103,7 @@ describe.concurrent('Conversation', () => {
     expect(conversation2.id()).toBe(conversation.id())
     expect(conversation2.groupDescription()).toBe(newDescription)
     const messages2 = await conversation2.findMessages()
-    expect(messages2.length).toBe(1)
+    expect(messages2.length).toBe(2)
   })
 
   it('should add and remove members', async () => {
@@ -226,7 +226,7 @@ describe.concurrent('Conversation', () => {
     expect(conversation2.id()).toBe(conversation.id())
 
     const messages2 = await conversation2.findMessages()
-    expect(messages2.length).toBe(1)
+    expect(messages2.length).toBe(2)
   })
 
   it('should optimistically send and list messages', async () => {
@@ -257,13 +257,13 @@ describe.concurrent('Conversation', () => {
     expect(conversation2.id()).toBe(conversation.id())
 
     const messages2 = await conversation2.findMessages()
-    expect(messages2.length).toBe(0)
+    expect(messages2.length).toBe(1)
 
     await conversation.publishMessages()
     await conversation2.sync()
 
     const messages4 = await conversation2.findMessages()
-    expect(messages4.length).toBe(1)
+    expect(messages4.length).toBe(2)
   })
 
   it('should stream messages', async () => {
@@ -284,12 +284,21 @@ describe.concurrent('Conversation', () => {
     expect(conversations[0].conversation.id()).toBe(conversation.id())
 
     const streamedMessages: string[] = []
-    const stream = conversations[0].conversation.stream((_, message) => {
-      streamedMessages.push(message!.id)
-    })
-
+    const stream = conversations[0].conversation.stream(
+      (_, message) => {
+        streamedMessages.push(message!.id)
+      },
+      () => {
+        console.log('closed')
+      }
+    )
+    await new Promise((resolve) => setTimeout(resolve, 10000))
     const message1 = await conversation.send(encodeTextMessage('gm'))
     const message2 = await conversation.send(encodeTextMessage('gm2'))
+
+    // Add sleep to allow messages to be processed
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+
     expect(streamedMessages).toContain(message1)
     expect(streamedMessages).toContain(message2)
   })

@@ -1,14 +1,16 @@
+use std::sync::Arc;
+
 use super::MlsGroup;
 use crate::{
-    groups::ScopedGroupClient,
+    context::XmtpMlsLocalContext,
     subscriptions::{
-        process_message::ProcessMessageFuture,
+        process_message::{ProcessFutureFactory, ProcessMessageFuture},
         stream_messages::{MessageStreamError, StreamGroupMessages},
         Result, SubscribeError,
     },
 };
 use xmtp_common::types::GroupId;
-use xmtp_db::group_message::StoredGroupMessage;
+use xmtp_db::{group_message::StoredGroupMessage, XmtpDb};
 
 use futures::{Stream, StreamExt};
 use prost::Message;
@@ -17,7 +19,11 @@ use xmtp_common::StreamHandle;
 use xmtp_proto::api_client::{trait_impls::XmtpApi, XmtpMlsStreams};
 use xmtp_proto::xmtp::mls::api::v1::GroupMessage;
 
-impl<ScopedClient: ScopedGroupClient> MlsGroup<ScopedClient> {
+impl<ApiClient, Db> MlsGroup<ApiClient, Db>
+where
+    ApiClient: XmtpApi,
+    Db: XmtpDb,
+{
     /// External proxy for `process_stream_entry`
     /// Converts some `SubscribeError` variants to an Option, if they are inconsequential.
     /// Useful for streaming outside of an InboxApp, like for Push Notifications.
@@ -29,8 +35,8 @@ impl<ScopedClient: ScopedGroupClient> MlsGroup<ScopedClient> {
         use crate::subscriptions::stream_messages::extract_message_v1;
         let envelope = GroupMessage::decode(envelope_bytes.as_slice())?;
         let msg = extract_message_v1(envelope).ok_or(MessageStreamError::InvalidPayload)?;
-        ProcessMessageFuture::new(&self.client, msg)?
-            .process()
+        ProcessMessageFuture::new(self.context.clone())
+            .create(msg)
             .await?
             .message
             .ok_or(SubscribeError::GroupMessageNotFound)
@@ -38,34 +44,54 @@ impl<ScopedClient: ScopedGroupClient> MlsGroup<ScopedClient> {
 
     pub async fn stream<'a>(
         &'a self,
-    ) -> Result<impl Stream<Item = Result<StoredGroupMessage>> + use<'a, ScopedClient>>
+    ) -> Result<impl Stream<Item = Result<StoredGroupMessage>> + use<'a, ApiClient, Db>>
     where
-        <ScopedClient as ScopedGroupClient>::ApiClient: XmtpMlsStreams + 'a,
+        ApiClient: XmtpMlsStreams + 'a,
     {
-        StreamGroupMessages::new(&self.client, vec![self.group_id.clone().into()]).await
+        StreamGroupMessages::new(&self.context, vec![self.group_id.clone().into()]).await
+    }
+
+    /// create a stream that is not attached to any lifetime
+    pub async fn stream_owned(
+        &self,
+    ) -> Result<impl Stream<Item = Result<StoredGroupMessage>> + 'static>
+    where
+        ApiClient: XmtpMlsStreams + Send + Sync + 'static,
+        Db: Send + Sync + 'static,
+    {
+        StreamGroupMessages::new_owned(self.context.clone(), vec![self.group_id.clone().into()])
+            .await
     }
 
     pub fn stream_with_callback(
-        client: ScopedClient,
+        context: Arc<XmtpMlsLocalContext<ApiClient, Db>>,
         group_id: Vec<u8>,
         #[cfg(target_arch = "wasm32")] callback: impl FnMut(Result<StoredGroupMessage>) + 'static,
         #[cfg(not(target_arch = "wasm32"))] callback: impl FnMut(Result<StoredGroupMessage>)
             + Send
             + 'static,
+        #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
+        #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
     ) -> impl StreamHandle<StreamOutput = Result<()>>
     where
-        ScopedClient: 'static,
-        <ScopedClient as ScopedGroupClient>::ApiClient: XmtpMlsStreams + 'static,
+        ApiClient: 'static,
+        ApiClient: XmtpMlsStreams + 'static,
+        Db: 'static,
     {
-        stream_messages_with_callback(client, vec![group_id.into()].into_iter(), callback)
+        stream_messages_with_callback(
+            context,
+            vec![group_id.into()].into_iter(),
+            callback,
+            on_close,
+        )
     }
 }
 
 // TODO: there's a better way than #[cfg]
 /// Stream messages from groups in `group_id_to_info`, passing
 /// messages along to a callback.
-pub(crate) fn stream_messages_with_callback<ScopedClient>(
-    client: ScopedClient,
+pub(crate) fn stream_messages_with_callback<ApiClient, Db>(
+    context: Arc<XmtpMlsLocalContext<ApiClient, Db>>,
     #[cfg(not(target_arch = "wasm32"))] active_conversations: impl Iterator<Item = GroupId>
         + Send
         + 'static,
@@ -74,22 +100,25 @@ pub(crate) fn stream_messages_with_callback<ScopedClient>(
     #[cfg(not(target_arch = "wasm32"))] mut callback: impl FnMut(Result<StoredGroupMessage>)
         + Send
         + 'static,
+    #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
+    #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
 ) -> impl StreamHandle<StreamOutput = Result<()>>
 where
-    ScopedClient: ScopedGroupClient + 'static,
-    <ScopedClient as ScopedGroupClient>::ApiClient: XmtpApi + XmtpMlsStreams + 'static,
+    ApiClient: XmtpApi + XmtpMlsStreams + 'static,
+    Db: XmtpDb + 'static,
 {
     let (tx, rx) = oneshot::channel();
 
     xmtp_common::spawn(Some(rx), async move {
-        let client_ref = &client;
-        let stream = StreamGroupMessages::new(client_ref, active_conversations.collect()).await?;
+        let context_ref = &context;
+        let stream = StreamGroupMessages::new(context_ref, active_conversations.collect()).await?;
         futures::pin_mut!(stream);
         let _ = tx.send(());
         while let Some(message) = stream.next().await {
             callback(message)
         }
         tracing::debug!("`stream_messages` stream ended, dropping stream");
+        on_close();
         Ok::<_, SubscribeError>(())
     })
 }
@@ -102,7 +131,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{builder::ClientBuilder, groups::GroupMetadataOptions};
+    use crate::builder::ClientBuilder;
     use xmtp_db::group_message::GroupMessageKind;
 
     use std::time::Duration;
@@ -117,9 +146,7 @@ pub(crate) mod tests {
         let amal = ClientBuilder::new_test_client(&generate_local_wallet()).await;
         let bola = ClientBuilder::new_test_client(&generate_local_wallet()).await;
 
-        let amal_group = amal
-            .create_group(None, GroupMetadataOptions::default())
-            .unwrap();
+        let amal_group = amal.create_group(None, None).unwrap();
         // Add bola
         amal_group
             .add_members_by_inbox_id(&[bola.inbox_id()])
@@ -128,6 +155,7 @@ pub(crate) mod tests {
 
         amal_group.send_message("hello".as_bytes()).await.unwrap();
         let messages = amal
+            .context
             .api_client
             .query_group_messages(amal_group.clone().group_id, None)
             .await
@@ -153,9 +181,7 @@ pub(crate) mod tests {
         let amal = ClientBuilder::new_test_client(&generate_local_wallet()).await;
         let bola = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
 
-        let amal_group = amal
-            .create_group(None, GroupMetadataOptions::default())
-            .unwrap();
+        let amal_group = amal.create_group(None, None).unwrap();
         // Add bola
         amal_group
             .add_members_by_inbox_id(&[bola.inbox_id()])
@@ -185,9 +211,7 @@ pub(crate) mod tests {
     #[cfg_attr(target_arch = "wasm32", ignore)]
     async fn test_subscribe_multiple() {
         let amal = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
-        let group = amal
-            .create_group(None, GroupMetadataOptions::default())
-            .unwrap();
+        let group = amal.create_group(None, None).unwrap();
 
         let stream = group.stream().await.unwrap();
         futures::pin_mut!(stream);
@@ -218,9 +242,7 @@ pub(crate) mod tests {
         let amal = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
         let bola = ClientBuilder::new_test_client(&generate_local_wallet()).await;
 
-        let amal_group = amal
-            .create_group(None, GroupMetadataOptions::default())
-            .unwrap();
+        let amal_group = amal.create_group(None, None).unwrap();
 
         let stream = amal_group.stream().await.unwrap();
         futures::pin_mut!(stream);

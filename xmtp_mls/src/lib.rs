@@ -4,20 +4,23 @@
 pub mod builder;
 pub mod client;
 pub mod configuration;
+pub mod context;
 pub mod groups;
-mod hpke;
 pub mod identity;
 pub mod identity_updates;
 mod intents;
+pub mod mls_store;
 mod mutex_registry;
 pub mod subscriptions;
 pub mod types;
 pub mod utils;
 pub mod verified_key_package_v2;
+pub mod worker;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test;
 
+use crate::groups::GroupError;
 pub use client::{Client, Network};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -25,6 +28,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use xmtp_db::{xmtp_openmls_provider::XmtpOpenMlsProvider, DuplicateItem, StorageError};
 pub use xmtp_id::InboxOwner;
+pub use xmtp_mls_common as common;
 pub use xmtp_proto::api_client::trait_impls::*;
 
 /// A manager for group-specific semaphores
@@ -48,7 +52,7 @@ impl GroupCommitLock {
     }
 
     /// Get or create a semaphore for a specific group and acquire it, returning a guard
-    pub async fn get_lock_async(&self, group_id: Vec<u8>) -> Result<MlsGroupGuard, GroupError> {
+    pub async fn get_lock_async(&self, group_id: Vec<u8>) -> MlsGroupGuard {
         let lock = {
             let mut locks = self.locks.lock();
             locks
@@ -57,9 +61,9 @@ impl GroupCommitLock {
                 .clone()
         };
 
-        Ok(MlsGroupGuard {
+        MlsGroupGuard {
             _permit: lock.lock_owned().await,
-        })
+        }
     }
 
     /// Get or create a semaphore for a specific group and acquire it synchronously
@@ -79,21 +83,17 @@ impl GroupCommitLock {
         Ok(MlsGroupGuard { _permit: permit })
     }
 }
-
 /// A guard that releases the semaphore when dropped
 pub struct MlsGroupGuard {
     _permit: tokio::sync::OwnedMutexGuard<()>,
 }
 
-use crate::groups::GroupError;
+#[cfg(all(test, target_arch = "wasm32"))]
+wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-#[cfg(test)]
-pub(crate) mod tests {
-    // Execute once before any tests are run
-    #[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
-    #[cfg(not(target_arch = "wasm32"))]
-    fn _setup() {
-        xmtp_common::logger();
-        let _ = fdlimit::raise_fd_limit();
-    }
+#[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn test_setup() {
+    xmtp_common::logger();
+    let _ = fdlimit::raise_fd_limit();
 }

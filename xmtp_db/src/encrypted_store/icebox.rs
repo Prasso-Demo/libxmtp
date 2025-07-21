@@ -40,13 +40,13 @@ impl Icebox {
                 SELECT *
                 FROM icebox
                 WHERE sequence_id = $1 AND originator_id = $2
-                
+
                 UNION ALL
-                
+
                 -- Recursive case: Join with dependencies
                 SELECT t.*
                 FROM icebox t
-                JOIN dependency_chain dc ON t.sequence_id = dc.depending_sequence_id 
+                JOIN dependency_chain dc ON t.sequence_id = dc.depending_sequence_id
                                         AND t.originator_id = dc.depending_originator_id
             )
             SELECT * FROM dependency_chain
@@ -71,13 +71,13 @@ impl Icebox {
                 SELECT *
                 FROM icebox
                 WHERE sequence_id = $1 AND originator_id = $2
-                
+
                 UNION ALL
-                
+
                 -- Recursive case: Join with dependents (reversed direction)
                 SELECT t.*
                 FROM icebox t
-                JOIN dependency_chain dc ON t.depending_sequence_id = dc.sequence_id 
+                JOIN dependency_chain dc ON t.depending_sequence_id = dc.sequence_id
                                         AND t.depending_originator_id = dc.originator_id
             )
             SELECT * FROM dependency_chain
@@ -123,7 +123,7 @@ mod tests {
         ]
     }
 
-    #[xmtp_common::test(unwrap_try = "true")]
+    #[xmtp_common::test(unwrap_try = true)]
     async fn icebox_dependency_chain() {
         with_connection(|conn| {
             let ice = iced();
@@ -138,7 +138,7 @@ mod tests {
         .await
     }
 
-    #[xmtp_common::test(unwrap_try = "true")]
+    #[xmtp_common::test(unwrap_try = true)]
     async fn test_icebox_wrong_originator() {
         with_connection(|conn| {
             // Break the chain by unsetting the originator.
@@ -157,7 +157,7 @@ mod tests {
         .await
     }
 
-    #[xmtp_common::test(unwrap_try = "true")]
+    #[xmtp_common::test(unwrap_try = true)]
     async fn test_icebox_wrong_sequence() {
         with_connection(|conn| {
             // Break the chain by unsetting the originator.
@@ -176,7 +176,7 @@ mod tests {
         .await
     }
 
-    #[xmtp_common::test(unwrap_try = "true")]
+    #[xmtp_common::test(unwrap_try = true)]
     async fn test_icebox_depending_fields_xor() {
         with_connection(|conn| {
             // Test to ensure that if one dependency field is set, they both are.

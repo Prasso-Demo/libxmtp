@@ -10,8 +10,22 @@ use std::fmt;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InstallationId([u8; 32]);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+impl InstallationId {
+    pub fn to_vec(self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GroupId(bytes::Bytes);
+
+impl std::fmt::Debug for GroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("GroupId")
+            .field(&crate::fmt::debug_hex(&self.0))
+            .finish()
+    }
+}
 
 impl AsRef<[u8]> for GroupId {
     fn as_ref(&self) -> &[u8] {
@@ -41,6 +55,12 @@ impl std::borrow::Borrow<[u8]> for GroupId {
 impl From<Vec<u8>> for GroupId {
     fn from(v: Vec<u8>) -> GroupId {
         GroupId(v.into())
+    }
+}
+
+impl From<&[u8]> for GroupId {
+    fn from(v: &[u8]) -> GroupId {
+        GroupId(v.to_vec().into())
     }
 }
 

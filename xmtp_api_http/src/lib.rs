@@ -24,6 +24,9 @@ use std::time::Duration;
 use xmtp_proto::api_client::{
     AggregateStats, ApiBuilder, ApiStats, IdentityStats, XmtpIdentityClient,
 };
+use xmtp_proto::mls_v1::{
+    BatchPublishCommitLogRequest, BatchQueryCommitLogRequest, BatchQueryCommitLogResponse,
+};
 use xmtp_proto::traits::{ApiClientError, HasStats};
 use xmtp_proto::xmtp::identity::api::v1::{
     GetIdentityUpdatesRequest as GetIdentityUpdatesV2Request,
@@ -372,6 +375,52 @@ impl XmtpMlsClient for XmtpHttpApiClient {
             .map_err(|e| ApiClientError::new(ApiEndpoint::QueryWelcomeMessages, e))
     }
 
+    async fn publish_commit_log(
+        &self,
+        request: BatchPublishCommitLogRequest,
+    ) -> Result<(), Self::Error> {
+        self.wait_for_ready().await;
+        self.stats.publish_commit_log.count_request();
+        let res = self
+            .http_client
+            .post(self.endpoint(ApiEndpoints::PUBLISH_COMMIT_LOG))
+            .headers(protobuf_headers()?)
+            .body(request.encode_to_vec())
+            .send()
+            .await
+            .map_err(|e| {
+                ApiClientError::new(ApiEndpoint::PublishCommitLog, HttpClientError::from(e))
+            })?;
+
+        tracing::debug!("publish_commit_log");
+        handle_error_proto(res)
+            .await
+            .map_err(|e| ApiClientError::new(ApiEndpoint::PublishCommitLog, e))
+    }
+
+    async fn query_commit_log(
+        &self,
+        request: BatchQueryCommitLogRequest,
+    ) -> Result<BatchQueryCommitLogResponse, Self::Error> {
+        self.wait_for_ready().await;
+        self.stats.query_commit_log.count_request();
+        let res = self
+            .http_client
+            .post(self.endpoint(ApiEndpoints::QUERY_COMMIT_LOG))
+            .headers(protobuf_headers()?)
+            .body(request.encode_to_vec())
+            .send()
+            .await
+            .map_err(|e| {
+                ApiClientError::new(ApiEndpoint::QueryCommitLog, HttpClientError::from(e))
+            })?;
+
+        tracing::debug!("query_commit_log");
+        handle_error_proto(res)
+            .await
+            .map_err(|e| ApiClientError::new(ApiEndpoint::QueryCommitLog, e))
+    }
+
     fn stats(&self) -> ApiStats {
         self.stats.clone()
     }
@@ -389,20 +438,21 @@ impl XmtpMlsStreams for XmtpHttpApiClient {
     // `Trait` yet.
 
     #[cfg(not(target_arch = "wasm32"))]
-    type GroupMessageStream<'a> = stream::BoxStream<'a, Result<GroupMessage, Self::Error>>;
+    type GroupMessageStream = stream::BoxStream<'static, Result<GroupMessage, Self::Error>>;
     #[cfg(not(target_arch = "wasm32"))]
-    type WelcomeMessageStream<'a> = stream::BoxStream<'a, Result<WelcomeMessage, Self::Error>>;
+    type WelcomeMessageStream = stream::BoxStream<'static, Result<WelcomeMessage, Self::Error>>;
 
     #[cfg(target_arch = "wasm32")]
-    type GroupMessageStream<'a> = stream::LocalBoxStream<'a, Result<GroupMessage, Self::Error>>;
+    type GroupMessageStream = stream::LocalBoxStream<'static, Result<GroupMessage, Self::Error>>;
     #[cfg(target_arch = "wasm32")]
-    type WelcomeMessageStream<'a> = stream::LocalBoxStream<'a, Result<WelcomeMessage, Self::Error>>;
+    type WelcomeMessageStream =
+        stream::LocalBoxStream<'static, Result<WelcomeMessage, Self::Error>>;
 
     #[tracing::instrument(skip_all)]
     async fn subscribe_group_messages(
         &self,
         request: SubscribeGroupMessagesRequest,
-    ) -> Result<Self::GroupMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::GroupMessageStream, Self::Error> {
         self.wait_for_ready().await;
         self.stats.subscribe_messages.count_request();
         Ok(create_grpc_stream::<_, GroupMessage>(
@@ -417,7 +467,7 @@ impl XmtpMlsStreams for XmtpHttpApiClient {
     async fn subscribe_welcome_messages(
         &self,
         request: SubscribeWelcomeMessagesRequest,
-    ) -> Result<Self::WelcomeMessageStream<'_>, Self::Error> {
+    ) -> Result<Self::WelcomeMessageStream, Self::Error> {
         self.wait_for_ready().await;
         self.stats.subscribe_welcomes.count_request();
         tracing::debug!("subscribe_welcome_messages");
@@ -542,14 +592,6 @@ pub mod tests {
     use crate::constants::ApiUrls;
 
     use super::*;
-
-    // Execute once before any tests are run
-    #[cfg_attr(not(target_arch = "wasm32"), ctor::ctor)]
-    #[cfg(not(target_arch = "wasm32"))]
-    #[cfg(test)]
-    fn _setup() {
-        xmtp_common::logger();
-    }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]

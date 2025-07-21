@@ -1,5 +1,4 @@
 use ed25519_dalek::SigningKey;
-use k256::schnorr::CryptoRngCore;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
 use openmls_traits::{signatures, types::SignatureScheme};
@@ -26,7 +25,7 @@ impl std::fmt::Display for SignerError {
         match self.inner {
             SigningError => write!(f, "signing error"),
             InvalidSignature => write!(f, "invalid signature"),
-            CryptoError(c) => write!(f, "{}", c),
+            CryptoError(c) => write!(f, "{c}"),
         }
     }
 }
@@ -85,11 +84,6 @@ impl XmtpInstallationCredential {
     /// Create a new [`XmtpInstallationCredential`] with [`rand_chacha::ChaCha20Rng`]
     pub fn new() -> Self {
         Self(Box::new(SigningKey::generate(&mut crate::utils::rng())))
-    }
-
-    /// Create a new [`XmtpInstallationCredential`] with custom RNG
-    pub fn with_rng<R: CryptoRngCore + ?Sized>(rng: &mut R) -> Self {
-        Self(Box::new(SigningKey::generate(rng)))
     }
 
     /// Get a reference to the public [`ed25519_dalek::VerifyingKey`]
@@ -264,7 +258,7 @@ impl<'de> serde::Deserialize<'de> for XmtpInstallationCredential {
         } = SignatureKeyPairRemote::deserialize(deserializer)?;
 
         Self::from_raw(private.as_slice(), public.as_slice())
-            .map_err(|e| <D as serde::Deserializer<'_>>::Error::custom(format!("{}", e)))
+            .map_err(|e| <D as serde::Deserializer<'_>>::Error::custom(format!("{e}")))
     }
 }
 

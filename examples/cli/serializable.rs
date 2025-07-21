@@ -20,7 +20,9 @@ pub struct SerializableGroup {
 }
 
 impl SerializableGroup {
-    pub async fn from<ApiClient: XmtpApi>(group: &MlsGroup<xmtp_mls::Client<ApiClient>>) -> Self {
+    pub async fn from<ApiClient: XmtpApi, Db: xmtp_db::XmtpDb>(
+        group: &MlsGroup<ApiClient, Db>,
+    ) -> Self {
         let group_id = hex::encode(group.group_id.clone());
         let members = group
             .members()

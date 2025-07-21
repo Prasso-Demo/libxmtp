@@ -5,11 +5,13 @@ use crate::{
     builder::{ClientBuilder, SyncWorkerMode},
     client::ClientError,
     configuration::DeviceSyncUrls,
-    groups::device_sync::handle::{SyncMetric, WorkerHandle},
+    groups::device_sync::worker::SyncMetric,
     subscriptions::SubscribeError,
+    utils::VersionInfo,
+    worker::metrics::WorkerMetrics,
     Client,
 };
-use ethers::signers::LocalWallet;
+use alloy::signers::local::PrivateKeySigner;
 use futures::Stream;
 use futures_executor::block_on;
 use parking_lot::Mutex;
@@ -19,9 +21,18 @@ use passkey::{
     types::{ctap2::*, rand::random_vec, webauthn::*, Bytes, Passkey},
 };
 use public_suffix::PublicSuffixList;
-use std::{ops::Deref, sync::Arc};
+use std::{
+    ops::Deref,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, LazyLock,
+    },
+};
+use tokio::{runtime::Handle, sync::OnceCell};
+use toxiproxy_rust::proxy::{Proxy, ProxyPack};
 use url::Url;
 use xmtp_api::XmtpApi;
+use xmtp_api_http::{constants::ApiUrls, LOCALHOST_ADDRESS};
 use xmtp_common::StreamHandle;
 use xmtp_common::TestLogReplace;
 use xmtp_cryptography::{signature::SignatureError, utils::generate_local_wallet};
@@ -38,6 +49,9 @@ use xmtp_id::{
 };
 use xmtp_proto::prelude::XmtpTestClient;
 
+pub static TOXIPROXY: OnceCell<toxiproxy_rust::client::Client> = OnceCell::const_new();
+pub static TOXI_PORT: AtomicUsize = AtomicUsize::new(21100);
+
 /// A test client wrapper that auto-exposes all of the usual component access boilerplate.
 /// Makes testing easier and less repetetive.
 pub struct Tester<Owner, Client>
@@ -47,8 +61,9 @@ where
     pub builder: TesterBuilder<Owner>,
     pub client: Arc<Client>,
     pub provider: Arc<XmtpOpenMlsProvider>,
-    pub worker: Option<Arc<WorkerHandle<SyncMetric>>>,
+    pub worker: Option<Arc<WorkerMetrics<SyncMetric>>>,
     pub stream_handle: Option<Box<dyn StreamHandle<StreamOutput = Result<(), SubscribeError>>>>,
+    pub proxy: Option<Proxy>,
     /// Replacement names for this tester
     /// Replacements are removed on drop
     pub replace: TestLogReplace,
@@ -83,8 +98,8 @@ macro_rules! tester {
     };
 }
 
-impl Tester<LocalWallet, FullXmtpClient> {
-    pub(crate) async fn new() -> Tester<LocalWallet, FullXmtpClient> {
+impl Tester<PrivateKeySigner, FullXmtpClient> {
+    pub(crate) async fn new() -> Tester<PrivateKeySigner, FullXmtpClient> {
         let wallet = generate_local_wallet();
         Tester::new_with_owner(wallet).await
     }
@@ -94,7 +109,7 @@ impl Tester<LocalWallet, FullXmtpClient> {
         Tester::new_with_owner(passkey_user).await
     }
 
-    pub(crate) fn builder() -> TesterBuilder<LocalWallet> {
+    pub(crate) fn builder() -> TesterBuilder<PrivateKeySigner> {
         TesterBuilder::new()
     }
 }
@@ -116,13 +131,46 @@ where
             let ident = self.owner.get_identifier().unwrap();
             replace.add(&ident.to_string(), &format!("{name}_ident"));
         }
-        let api_client = ClientBuilder::new_api_client().await;
+
+        let mut api_addr = format!("localhost:{}", ClientBuilder::local_port());
+        let mut proxy = None;
+
+        if self.proxy {
+            let toxiproxy = TOXIPROXY
+                .get_or_init(|| async {
+                    let toxiproxy = toxiproxy_rust::client::Client::new("0.0.0.0:8474");
+                    toxiproxy.reset().await.unwrap();
+                    toxiproxy
+                })
+                .await;
+
+            let port = TOXI_PORT.fetch_add(1, Ordering::SeqCst);
+
+            let result = toxiproxy
+                .populate(vec![
+                    ProxyPack::new(
+                        format!("Proxy {port}"),
+                        format!("[::]:{port}"),
+                        format!("node:{}", ClientBuilder::local_port()),
+                    )
+                    .await,
+                ])
+                .await
+                .unwrap();
+
+            proxy = Some(result.into_iter().nth(0).unwrap());
+            api_addr = format!("localhost:{port}");
+        }
+
+        let api_client = ClientBuilder::new_custom_api_client(&format!("http://{api_addr}")).await;
         let client = build_with_verifier(
             &self.owner,
             api_client,
             MockSmartContractSignatureVerifier::new(true),
             self.sync_url.as_deref(),
             Some(self.sync_mode),
+            self.version.clone(),
+            Some(!self.events),
         )
         .await;
         let client = Arc::new(client);
@@ -134,7 +182,7 @@ where
             replace.add(client.inbox_id(), name);
         }
         let provider = client.mls_provider();
-        let worker = client.device_sync.worker_handle();
+        let worker = client.context.sync_metrics();
         if let Some(worker) = &worker {
             if self.wait_for_init {
                 worker.wait_for_init().await.unwrap();
@@ -149,6 +197,7 @@ where
             worker,
             replace,
             stream_handle: None,
+            proxy,
         };
 
         if self.stream {
@@ -173,6 +222,7 @@ where
             None,
             None,
             |_| {},
+            || {},
         );
         let handle = Box::new(handle) as Box<_>;
         self.stream_handle = Some(handle);
@@ -187,8 +237,12 @@ where
     pub fn builder_from(owner: Owner) -> TesterBuilder<Owner> {
         TesterBuilder::new().owner(owner)
     }
-    pub fn worker(&self) -> &Arc<WorkerHandle<SyncMetric>> {
+    pub fn worker(&self) -> &Arc<WorkerMetrics<SyncMetric>> {
         self.worker.as_ref().unwrap()
+    }
+
+    pub fn proxy(&self) -> &Proxy {
+        self.proxy.as_ref().unwrap()
     }
 }
 
@@ -214,15 +268,18 @@ where
     pub wait_for_init: bool,
     pub stream: bool,
     pub name: Option<String>,
+    pub events: bool,
+    pub version: Option<VersionInfo>,
+    pub proxy: bool,
 }
 
-impl TesterBuilder<LocalWallet> {
+impl TesterBuilder<PrivateKeySigner> {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Default for TesterBuilder<LocalWallet> {
+impl Default for TesterBuilder<PrivateKeySigner> {
     fn default() -> Self {
         Self {
             owner: generate_local_wallet(),
@@ -231,6 +288,9 @@ impl Default for TesterBuilder<LocalWallet> {
             wait_for_init: true,
             stream: false,
             name: None,
+            events: false,
+            version: None,
+            proxy: false,
         }
     }
 }
@@ -250,6 +310,9 @@ where
             wait_for_init: self.wait_for_init,
             stream: self.stream,
             name: self.name,
+            events: self.events,
+            version: self.version,
+            proxy: self.proxy,
         }
     }
 
@@ -259,6 +322,13 @@ where
     pub fn with_name(self, s: &str) -> TesterBuilder<Owner> {
         Self {
             name: Some(s.to_string()),
+            ..self
+        }
+    }
+
+    pub fn version(self, version: VersionInfo) -> Self {
+        Self {
+            version: Some(version),
             ..self
         }
     }
@@ -284,6 +354,20 @@ where
     pub fn stream(self) -> Self {
         Self {
             stream: true,
+            ..self
+        }
+    }
+
+    pub fn proxy(self) -> Self {
+        Self {
+            proxy: true,
+            ..self
+        }
+    }
+
+    pub fn events(self) -> Self {
+        Self {
+            events: true,
             ..self
         }
     }

@@ -2,7 +2,7 @@ use crate::consent_state::{Consent, ConsentState};
 use crate::identity::Identifier;
 use crate::messages::Message;
 use crate::permissions::{GroupPermissionsOptions, PermissionPolicySet};
-use crate::streams::{StreamCallback, StreamCloser};
+use crate::streams::{ConversationStream, StreamCallback, StreamCloser};
 use crate::user_preferences::UserPreference;
 use crate::{client::RustXmtpClient, conversation::Conversation};
 use std::collections::HashMap;
@@ -10,13 +10,15 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::UnwrapThrowExt;
 use wasm_bindgen::{JsError, JsValue};
+use wasm_streams::ReadableStream;
 use xmtp_db::consent_record::ConsentState as XmtpConsentState;
 use xmtp_db::group::ConversationType as XmtpConversationType;
 use xmtp_db::group::GroupMembershipState as XmtpGroupMembershipState;
 use xmtp_db::group::GroupQueryArgs;
 use xmtp_db::user_preferences::HmacKey as XmtpHmacKey;
-use xmtp_mls::groups::group_mutable_metadata::MessageDisappearingSettings as XmtpMessageDisappearingSettings;
-use xmtp_mls::groups::{DMMetadataOptions, GroupMetadataOptions, PreconfiguredPolicies};
+use xmtp_mls::common::group::{DMMetadataOptions, GroupMetadataOptions};
+use xmtp_mls::common::group_mutable_metadata::MessageDisappearingSettings as XmtpMessageDisappearingSettings;
+use xmtp_mls::groups::PreconfiguredPolicies;
 
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
@@ -107,6 +109,7 @@ impl From<ListConversationsOptions> for GroupQueryArgs {
       conversation_type: opts.conversation_type.map(Into::into),
       include_sync_groups: false,
       activity_after_ns: None,
+      should_publish_commit_log: None,
     }
   }
 }
@@ -178,6 +181,12 @@ pub struct ConversationDebugInfo {
   #[wasm_bindgen(js_name = forkDetails)]
   #[serde(rename = "forkDetails")]
   pub fork_details: String,
+  #[wasm_bindgen(js_name = localCommitLog)]
+  #[serde(rename = "localCommitLog")]
+  pub local_commit_log: String,
+  #[wasm_bindgen(js_name = cursor)]
+  #[serde(rename = "cursor")]
+  pub cursor: i64,
 }
 
 #[wasm_bindgen(getter_with_clone)]
@@ -354,7 +363,7 @@ impl Conversations {
 
     let group = self
       .inner_client
-      .create_group(group_permissions, metadata_options)
+      .create_group(group_permissions, Some(metadata_options))
       .map_err(|e| JsError::new(format!("{}", e).as_str()))?;
 
     Ok(group.into())
@@ -536,12 +545,27 @@ impl Conversations {
     Ok(crate::to_value(&hmac_map)?)
   }
 
+  /// Returns a 'ReadableStream' of Conversations
+  #[wasm_bindgen(js_name = streamLocal)]
+  pub async fn stream_conversations_local(
+    &self,
+    conversation_type: Option<ConversationType>,
+  ) -> Result<web_sys::ReadableStream, JsError> {
+    let stream = self
+      .inner_client
+      .stream_conversations_owned(conversation_type.map(Into::into))
+      .await?;
+    let stream = ConversationStream::new(stream);
+    Ok(ReadableStream::from_stream(stream).into_raw())
+  }
+
   #[wasm_bindgen(js_name = stream)]
   pub fn stream(
     &self,
     callback: StreamCallback,
     conversation_type: Option<ConversationType>,
   ) -> Result<StreamCloser, JsError> {
+    let on_close_cb = callback.clone();
     let stream_closer = RustXmtpClient::stream_conversations_with_callback(
       self.inner_client.clone(),
       conversation_type.map(Into::into),
@@ -549,6 +573,7 @@ impl Conversations {
         Ok(item) => callback.on_conversation(item.into()),
         Err(e) => callback.on_error(JsError::from(e)),
       },
+      move || on_close_cb.on_close(),
     );
 
     Ok(StreamCloser::new(stream_closer))
@@ -564,6 +589,7 @@ impl Conversations {
     let consents: Option<Vec<XmtpConsentState>> =
       consent_states.map(|states| states.into_iter().map(|state| state.into()).collect());
 
+    let on_close_cb = callback.clone();
     let stream_closer = RustXmtpClient::stream_all_messages_with_callback(
       self.inner_client.clone(),
       conversation_type.map(Into::into),
@@ -572,37 +598,42 @@ impl Conversations {
         Ok(m) => callback.on_message(m.into()),
         Err(e) => callback.on_error(JsError::from(e)),
       },
+      move || on_close_cb.on_close(),
     );
     Ok(StreamCloser::new(stream_closer))
   }
 
   #[wasm_bindgen(js_name = "streamConsent")]
   pub fn stream_consent(&self, callback: StreamCallback) -> Result<StreamCloser, JsError> {
-    let stream_closer =
-      RustXmtpClient::stream_consent_with_callback(self.inner_client.clone(), move |message| {
-        match message {
-          Ok(m) => {
-            let array = m.into_iter().map(Consent::from).collect::<Vec<Consent>>();
-            let value = serde_wasm_bindgen::to_value(&array).unwrap_throw();
-            callback.on_consent_update(value)
-          }
-          Err(e) => callback.on_error(JsError::from(e)),
+    let on_close_cb = callback.clone();
+    let stream_closer = RustXmtpClient::stream_consent_with_callback(
+      self.inner_client.clone(),
+      move |message| match message {
+        Ok(m) => {
+          let array = m.into_iter().map(Consent::from).collect::<Vec<Consent>>();
+          let value = serde_wasm_bindgen::to_value(&array).unwrap_throw();
+          callback.on_consent_update(value)
         }
-      });
+        Err(e) => callback.on_error(JsError::from(e)),
+      },
+      move || on_close_cb.on_close(),
+    );
     Ok(StreamCloser::new(stream_closer))
   }
 
   #[wasm_bindgen(js_name = "streamPreferences")]
   pub fn stream_preferences(&self, callback: StreamCallback) -> Result<StreamCloser, JsError> {
-    let stream_closer =
-      RustXmtpClient::stream_preferences_with_callback(self.inner_client.clone(), move |message| {
-        match message {
-          Ok(m) => {
-            callback.on_user_preference_update(m.into_iter().map(UserPreference::from).collect())
-          }
-          Err(e) => callback.on_error(JsError::from(e)),
+    let on_close_cb = callback.clone();
+    let stream_closer = RustXmtpClient::stream_preferences_with_callback(
+      self.inner_client.clone(),
+      move |message| match message {
+        Ok(m) => {
+          callback.on_user_preference_update(m.into_iter().map(UserPreference::from).collect())
         }
-      });
+        Err(e) => callback.on_error(JsError::from(e)),
+      },
+      move || on_close_cb.on_close(),
+    );
     Ok(StreamCloser::new(stream_closer))
   }
 }

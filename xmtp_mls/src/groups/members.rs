@@ -1,7 +1,11 @@
-use super::{validated_commit::extract_group_membership, GroupError, MlsGroup, ScopedGroupClient};
+use crate::identity_updates::IdentityUpdates;
+
+use super::{validated_commit::extract_group_membership, GroupError, MlsGroup};
+use xmtp_api::XmtpApi;
 use xmtp_db::{
     association_state::StoredAssociationState,
     consent_record::{ConsentState, ConsentType},
+    XmtpDb,
 };
 use xmtp_id::{
     associations::{AssociationState, Identifier},
@@ -24,9 +28,10 @@ pub enum PermissionLevel {
     SuperAdmin,
 }
 
-impl<ScopedClient> MlsGroup<ScopedClient>
+impl<ApiClient, Db> MlsGroup<ApiClient, Db>
 where
-    ScopedClient: ScopedGroupClient,
+    ApiClient: XmtpApi,
+    Db: XmtpDb,
 {
     /// Load the member list for the group from the DB, merging together multiple installations into a single entry
     pub async fn members(&self) -> Result<Vec<GroupMember>, GroupError> {
@@ -44,7 +49,6 @@ where
         let conn = provider.db();
         let mut association_states: Vec<AssociationState> =
             StoredAssociationState::batch_read_from_cache(conn, requests.clone())?;
-        let mutable_metadata = self.mutable_metadata()?;
         if association_states.len() != requests.len() {
             // Attempt to rebuild the cache.
             let missing_requests: Vec<_> = requests
@@ -60,9 +64,8 @@ where
                     Some((id.as_str(), Some(*sequence)))
                 })
                 .collect();
-
-            let mut new_states = self
-                .client
+            let identity_updates = IdentityUpdates::new(self.context.clone());
+            let mut new_states = identity_updates
                 .batch_get_association_state(conn, &missing_requests)
                 .await?;
             association_states.append(&mut new_states);
@@ -79,7 +82,7 @@ where
                 return Err(GroupError::InvalidGroupMembership);
             }
         }
-
+        let mutable_metadata = self.mutable_metadata()?;
         let members = association_states
             .into_iter()
             .map(|association_state| {
