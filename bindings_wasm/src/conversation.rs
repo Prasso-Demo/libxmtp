@@ -124,6 +124,7 @@ impl Conversation {
       self.inner_group.context.clone(),
       self.group_id.clone(),
       self.dm_id.clone(),
+      self.inner_group.conversation_type,
       self.created_at_ns,
     )
   }
@@ -729,6 +730,7 @@ mod tests {
       reference_id: None,
       originator_id: None,
       sequence_id: None,
+      expire_at_ns: None,
     };
     crate::to_value(&stored_message).unwrap();
   }
