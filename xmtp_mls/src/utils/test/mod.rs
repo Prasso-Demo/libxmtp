@@ -9,18 +9,19 @@ pub mod test_mocks_helpers;
 
 use crate::XmtpApi;
 use crate::{
+    Client, InboxOwner,
     builder::{ClientBuilder, SyncWorkerMode},
     context::{XmtpMlsLocalContext, XmtpSharedContext},
     identity::IdentityStrategy,
-    Client, InboxOwner,
 };
+use alloy::signers::local::PrivateKeySigner;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 use xmtp_api::ApiIdentifier;
 use xmtp_common::time::Expired;
-use xmtp_db::{sql_key_store::SqlKeyStore, XmtpMlsStorageProvider};
 use xmtp_db::{ConnectionExt, DbConnection, XmtpTestDb};
-use xmtp_id::associations::{test_utils::MockSmartContractSignatureVerifier, Identifier};
+use xmtp_db::{XmtpMlsStorageProvider, sql_key_store::SqlKeyStore};
+use xmtp_id::associations::{Identifier, test_utils::MockSmartContractSignatureVerifier};
 use xmtp_proto::api_client::{ApiBuilder, XmtpTestClient};
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -30,9 +31,11 @@ pub type TestMlsStorage = SqlKeyStore<xmtp_db::DefaultDbConnection>;
 pub type TestXmtpMlsContext =
     Arc<XmtpMlsLocalContext<TestClient, xmtp_db::DefaultStore, TestMlsStorage>>;
 pub type FullXmtpClient = Client<TestXmtpMlsContext>;
+/// Default Client Tester type
+pub type ClientTester = Tester<PrivateKeySigner, FullXmtpClient>;
 pub type TestMlsGroup = crate::groups::MlsGroup<TestXmtpMlsContext>;
 
-#[cfg(not(any(feature = "http-api", target_arch = "wasm32")))]
+#[cfg(not(any(feature = "http-api", target_arch = "wasm32", feature = "d14n")))]
 pub type TestClient = xmtp_api_grpc::grpc_api_helper::Client;
 
 #[cfg(all(
@@ -62,7 +65,11 @@ impl<A, S> ClientBuilder<A, S> {
             .build()
             .await
             .unwrap();
-        self.api_client(api_client)
+        let sync_api_client = <TestClient as XmtpTestClient>::create_dev()
+            .build()
+            .await
+            .unwrap();
+        self.api_clients(api_client, sync_api_client)
     }
 
     pub async fn local(self) -> ClientBuilder<TestClient, S> {
@@ -70,7 +77,11 @@ impl<A, S> ClientBuilder<A, S> {
             .build()
             .await
             .unwrap();
-        self.api_client(api_client)
+        let sync_api_client = <TestClient as XmtpTestClient>::create_local()
+            .build()
+            .await
+            .unwrap();
+        self.api_clients(api_client, sync_api_client)
     }
 }
 
@@ -86,17 +97,6 @@ where
 }
 
 impl ClientBuilder<TestClient, TestMlsStorage> {
-    pub fn local_port() -> &'static str {
-        <TestClient as XmtpTestClient>::local_port()
-    }
-
-    pub async fn new_custom_api_client(addr: &str) -> TestClient {
-        <TestClient as XmtpTestClient>::create_custom(addr)
-            .build()
-            .await
-            .unwrap()
-    }
-
     pub async fn new_test_builder(owner: &impl InboxOwner) -> ClientBuilder<(), TestMlsStorage> {
         let strategy = identity_setup(owner);
         Client::builder(strategy)
@@ -104,7 +104,7 @@ impl ClientBuilder<TestClient, TestMlsStorage> {
             .await
             .with_disable_events(None)
             .with_scw_verifier(MockSmartContractSignatureVerifier::new(true))
-            .device_sync_server_url(crate::configuration::DeviceSyncUrls::LOCAL_ADDRESS)
+            .device_sync_server_url(xmtp_configuration::DeviceSyncUrls::LOCAL_ADDRESS)
             .enable_sqlite_triggers()
             .default_mls_store()
             .unwrap()
@@ -160,10 +160,14 @@ impl ClientBuilder<TestClient, TestMlsStorage> {
             .build()
             .await
             .unwrap();
+        let sync_api_client = <TestClient as XmtpTestClient>::create_dev()
+            .build()
+            .await
+            .unwrap();
 
         let client = Self::new_test_builder(owner)
             .await
-            .api_client(api_client)
+            .api_clients(api_client, sync_api_client)
             .build()
             .await
             .unwrap();
@@ -181,9 +185,14 @@ impl ClientBuilder<TestClient, TestMlsStorage> {
             .await
             .unwrap();
 
+        let sync_api_client = <TestClient as XmtpTestClient>::create_local()
+            .build()
+            .await
+            .unwrap();
+
         let client = Self::new_test_builder(owner)
             .await
-            .api_client(api_client)
+            .api_clients(api_client, sync_api_client)
             .device_sync_server_url(history_sync_url)
             .build()
             .await
@@ -196,7 +205,11 @@ impl ClientBuilder<TestClient, TestMlsStorage> {
 
 impl<ApiClient, Db> ClientBuilder<ApiClient, Db> {
     pub async fn local_client(self) -> ClientBuilder<TestClient, Db> {
-        self.api_client(
+        self.api_clients(
+            <TestClient as XmtpTestClient>::create_local()
+                .build()
+                .await
+                .unwrap(),
             <TestClient as XmtpTestClient>::create_local()
                 .build()
                 .await
@@ -205,7 +218,11 @@ impl<ApiClient, Db> ClientBuilder<ApiClient, Db> {
     }
 
     pub async fn dev_client(self) -> ClientBuilder<TestClient, Db> {
-        self.api_client(
+        self.api_clients(
+            <TestClient as XmtpTestClient>::create_dev()
+                .build()
+                .await
+                .unwrap(),
             <TestClient as XmtpTestClient>::create_dev()
                 .build()
                 .await

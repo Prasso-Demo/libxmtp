@@ -1,5 +1,5 @@
-use super::{process_welcome::ProcessWelcomeResult, LocalEvents, Result, SubscribeError};
-use crate::subscriptions::stream_utils::{multiplexed, MultiplexedStream};
+use super::{LocalEvents, Result, SubscribeError, process_welcome::ProcessWelcomeResult};
+use crate::subscriptions::stream_utils::{MultiplexedStream, multiplexed};
 use crate::{
     context::XmtpSharedContext, groups::MlsGroup,
     subscriptions::process_welcome::ProcessWelcomeFuture,
@@ -13,7 +13,7 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     pin::Pin,
-    task::{ready, Poll},
+    task::{Poll, ready},
 };
 use tokio_stream::wrappers::BroadcastStream;
 use xmtp_common::FutureWrapper;
@@ -161,6 +161,7 @@ pin_project! {
         #[pin] welcome_syncs: JoinSet<Result<ProcessWelcomeResult<Context>>>,
         conversation_type: Option<ConversationType>,
         known_welcome_ids: HashSet<i64>,
+        include_duplicated_dms: bool,
     }
 }
 
@@ -209,6 +210,7 @@ where
     /// # Arguments
     /// * `client` - Reference to the client used for API communication
     /// * `conversation_type` - Optional filter to only receive specific conversation types
+    /// * `include_duplicate_dms` - Optional filter to include duplicate dms in the stream
     ///
     /// # Returns
     /// * `Result<Self>` - A new conversation stream if successful
@@ -218,17 +220,23 @@ where
     /// - Database operations fail
     /// - API subscription creation fails
     ///
-    /// # Example
-    /// ```
-    /// let stream = StreamConversations::new(&client, Some(ConversationType::Dm)).await?;
-    /// ```
-    pub async fn new(context: &'a C, conversation_type: Option<ConversationType>) -> Result<Self> {
-        Self::from_cow(Cow::Borrowed(context), conversation_type).await
+    pub async fn new(
+        context: &'a C,
+        conversation_type: Option<ConversationType>,
+        include_duplicate_dms: bool,
+    ) -> Result<Self> {
+        Self::from_cow(
+            Cow::Borrowed(context),
+            conversation_type,
+            include_duplicate_dms,
+        )
+        .await
     }
 
     pub async fn from_cow(
         context: Cow<'a, C>,
         conversation_type: Option<ConversationType>,
+        include_duplicated_dms: bool,
     ) -> Result<Self> {
         let conn = context.db();
         let installation_key = context.installation_id();
@@ -258,6 +266,7 @@ where
             known_welcome_ids,
             conversation_type,
             welcome_syncs: JoinSet::new(),
+            include_duplicated_dms,
         })
     }
 }
@@ -271,8 +280,14 @@ where
     pub async fn new_owned(
         context: C,
         conversation_type: Option<ConversationType>,
+        include_duplicate_dms: bool,
     ) -> Result<Self> {
-        Self::from_cow(Cow::Owned(context), conversation_type).await
+        Self::from_cow(
+            Cow::Owned(context),
+            conversation_type,
+            include_duplicate_dms,
+        )
+        .await
     }
 }
 
@@ -314,6 +329,7 @@ where
                     this.context.clone().into_owned(),
                     welcome_envelope?,
                     *this.conversation_type,
+                    *this.include_duplicated_dms,
                 )?;
                 this.welcome_syncs.spawn(future.process());
                 cx.waker().wake_by_ref();
@@ -378,13 +394,13 @@ where
 
 #[cfg(test)]
 mod test {
+    use crate::utils::ClientTester;
     use std::sync::Arc;
 
     use super::*;
     use crate::builder::ClientBuilder;
     use crate::tester;
     use crate::utils::fixtures::{alix, bo};
-    use crate::utils::FullXmtpClient;
     use xmtp_db::group::GroupQueryArgs;
 
     use futures::StreamExt;
@@ -400,12 +416,14 @@ mod test {
     #[timeout(std::time::Duration::from_secs(5))]
     #[awt]
     async fn stream_welcomes(
-        #[future] alix: FullXmtpClient,
-        #[future] bo: FullXmtpClient,
+        #[future] alix: ClientTester,
+        #[future] bo: ClientTester,
         #[case] group_size: usize,
     ) {
         let mut groups = vec![];
-        let mut stream = StreamConversations::new(&bo.context, None).await.unwrap();
+        let mut stream = StreamConversations::new(&bo.context, None, false)
+            .await
+            .unwrap();
         for _ in 0..group_size {
             let alix_bo_group = alix.create_group(None, None).unwrap();
             groups.push(alix_bo_group.group_id.clone());
@@ -430,7 +448,7 @@ mod test {
     #[xmtp_common::test(unwrap_try = true)]
     async fn test_sync_groups_are_not_streamed() {
         tester!(alix, sync_worker);
-        let stream = alix.stream_conversations(None).await?;
+        let stream = alix.stream_conversations(None, false).await?;
         futures::pin_mut!(stream);
 
         tester!(_alix2, from: alix);
@@ -451,7 +469,7 @@ mod test {
         tester!(alix);
         tester!(bo);
         let stream = alix
-            .stream_conversations(Some(conversation_type))
+            .stream_conversations(Some(conversation_type), false)
             .await
             .unwrap();
         futures::pin_mut!(stream);
@@ -491,7 +509,7 @@ mod test {
         // Start a stream with all conversations
         let mut groups = Vec::new();
         // Wait for 2 seconds for the group creation to be streamed
-        let stream = alix.stream_conversations(None).await.unwrap();
+        let stream = alix.stream_conversations(None, false).await.unwrap();
         futures::pin_mut!(stream);
 
         alix.find_or_create_dm_by_inbox_id(davon.inbox_id().to_string(), None)
@@ -532,7 +550,7 @@ mod test {
         tester!(bo);
 
         let stream = alix
-            .stream_conversations(Some(ConversationType::Group))
+            .stream_conversations(Some(ConversationType::Group), false)
             .await
             .unwrap();
         futures::pin_mut!(stream);
@@ -571,7 +589,7 @@ mod test {
             .unwrap();
         bo.sync_welcomes().await.unwrap();
         let stream = bo
-            .stream_conversations(Some(ConversationType::Group))
+            .stream_conversations(Some(ConversationType::Group), false)
             .await
             .unwrap();
         futures::pin_mut!(stream);
@@ -595,7 +613,7 @@ mod test {
         let client1 = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
         let client2 = Arc::new(ClientBuilder::new_test_client(&generate_local_wallet()).await);
 
-        let mut stream = client1.stream_conversations(None).await.unwrap();
+        let mut stream = client1.stream_conversations(None, false).await.unwrap();
 
         // First DM - should stream
         let dm1 = client1
@@ -628,7 +646,7 @@ mod test {
     #[xmtp_common::test]
     #[timeout(std::time::Duration::from_secs(120))]
     #[awt]
-    async fn test_many_concurrent_dm_invites(#[future] alix: FullXmtpClient, #[case] dms: usize) {
+    async fn test_many_concurrent_dm_invites(#[future] alix: ClientTester, #[case] dms: usize) {
         let alix_inbox_id = Arc::new(alix.inbox_id().to_string());
         let mut clients = vec![];
         for _ in 0..dms {

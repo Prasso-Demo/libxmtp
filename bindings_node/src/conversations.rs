@@ -160,7 +160,9 @@ pub struct ConversationDebugInfo {
   pub epoch: BigInt,
   pub maybe_forked: bool,
   pub fork_details: String,
+  pub is_commit_log_forked: Option<bool>,
   pub local_commit_log: String,
+  pub remote_commit_log: String,
   pub cursor: i64,
 }
 
@@ -170,7 +172,9 @@ impl From<XmtpConversationDebugInfo> for ConversationDebugInfo {
       epoch: BigInt::from(value.epoch),
       maybe_forked: value.maybe_forked,
       fork_details: value.fork_details,
+      is_commit_log_forked: value.is_commit_log_forked,
       local_commit_log: value.local_commit_log,
+      remote_commit_log: value.remote_commit_log,
       cursor: value.cursor,
     }
   }
@@ -209,6 +213,7 @@ impl From<XmtpUserPreferenceUpdate> for Tag<UserPreferenceUpdate> {
 pub struct ConversationListItem {
   conversation: Conversation,
   last_message: Option<Message>,
+  is_commit_log_forked: Option<bool>,
 }
 
 #[napi]
@@ -221,6 +226,11 @@ impl ConversationListItem {
   #[napi(getter)]
   pub fn last_message(&self) -> Option<Message> {
     self.last_message.clone()
+  }
+
+  #[napi(getter)]
+  pub fn is_commit_log_forked(&self) -> Option<bool> {
+    self.is_commit_log_forked
   }
 }
 
@@ -490,6 +500,7 @@ impl Conversations {
         last_message: conversation_item
           .last_message
           .map(|stored_message| stored_message.into()),
+        is_commit_log_forked: conversation_item.is_commit_log_forked,
       })
       .collect();
 
@@ -551,6 +562,7 @@ impl Conversations {
       move || {
         tsfn_on_close.call(Ok(()), ThreadsafeFunctionCallMode::Blocking);
       },
+      false,
     );
 
     Ok(StreamCloser::new(stream_closer))

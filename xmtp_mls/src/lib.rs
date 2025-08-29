@@ -3,12 +3,12 @@
 
 pub mod builder;
 pub mod client;
-pub mod configuration;
 pub mod context;
 pub mod groups;
 pub mod identity;
 pub mod identity_updates;
 mod intents;
+pub mod messages;
 pub mod mls_store;
 mod mutex_registry;
 pub mod subscriptions;

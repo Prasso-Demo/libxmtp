@@ -1,7 +1,7 @@
 use xmtp_common::{RetryableError, retryable};
 
 use crate::{
-    ConnectionExt, MlsKeyStore, XmtpMlsStorageProvider,
+    ConnectionExt, TransactionalKeyStore, XmtpMlsStorageProvider,
     sql_key_store::transactions::MutableTransactionConnection,
 };
 
@@ -13,6 +13,9 @@ use diesel::{
 };
 use openmls_traits::storage::*;
 use serde::Serialize;
+
+#[cfg(any(feature = "test-utils", test))]
+pub mod mock;
 mod transactions;
 
 const SELECT_QUERY: &str =
@@ -30,9 +33,9 @@ struct StorageData {
     value_bytes: Vec<u8>,
 }
 
-impl MlsKeyStore for diesel::SqliteConnection {
+impl TransactionalKeyStore for diesel::SqliteConnection {
     type Store<'a>
-        = SqlKeyStore<MutableTransactionConnection<'a, Self>>
+        = SqlKeyStore<MutableTransactionConnection<'a>>
     where
         Self: 'a;
 
@@ -47,26 +50,19 @@ pub struct SqlKeyStore<T> {
     conn: T,
 }
 
-impl<'a, A> SqlKeyStore<A> {
+impl<A> SqlKeyStore<A> {
     pub fn new(conn: A) -> Self {
         Self { conn }
     }
+}
 
-    pub fn new_transactional(conn: &'a mut A) -> SqlKeyStore<MutableTransactionConnection<'a, A>> {
+impl<'a> SqlKeyStore<SqliteConnection> {
+    pub fn new_transactional(
+        conn: &'a mut SqliteConnection,
+    ) -> SqlKeyStore<MutableTransactionConnection<'a>> {
         SqlKeyStore {
             conn: MutableTransactionConnection::new(conn),
         }
-    }
-}
-
-impl<D, C> From<D> for SqlKeyStore<D>
-where
-    D: crate::DbQuery<C>,
-    D: ConnectionExt<Connection = C>,
-    C: ConnectionExt,
-{
-    fn from(value: D) -> Self {
-        Self { conn: value }
     }
 }
 
@@ -293,6 +289,7 @@ const SIGNATURE_KEY_PAIR_LABEL: &[u8] = b"SignatureKeyPair";
 const EPOCH_KEY_PAIRS_LABEL: &[u8] = b"EpochKeyPairs";
 pub const KEY_PACKAGE_REFERENCES: &[u8] = b"KeyPackageReferences";
 pub const KEY_PACKAGE_WRAPPER_PRIVATE_KEY: &[u8] = b"KeyPackageWrapperPrivateKey";
+pub const COMMIT_LOG_SIGNER_PRIVATE_KEY: &[u8] = b"CommitLogSignerPrivateKey";
 
 // related to PublicGroup
 const TREE_LABEL: &[u8] = b"Tree";
@@ -1048,6 +1045,17 @@ impl From<bincode::Error> for SqlKeyStoreError {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+impl SqlKeyStore<crate::test_utils::MemoryStorage> {
+    pub fn kv_pairs(&self) -> String {
+        self.conn.key_value_pairs()
+    }
+
+    pub fn kv_pairs_utf8(&self) -> String {
+        self.conn.key_value_pairs_utf8()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     #[cfg(target_arch = "wasm32")]
@@ -1065,6 +1073,7 @@ pub(crate) mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::SqlKeyStore;
+    use crate::encrypted_store::MlsProviderExt;
     use crate::{
         XmtpTestDb, sql_key_store::SqlKeyStoreError, xmtp_openmls_provider::XmtpOpenMlsProvider,
     };
@@ -1118,6 +1127,41 @@ pub(crate) mod tests {
     impl traits::ProposalRef<CURRENT_VERSION> for ProposalRef {}
     impl Key<CURRENT_VERSION> for ProposalRef {}
     impl Entity<CURRENT_VERSION> for ProposalRef {}
+
+    #[xmtp_common::test(unwrap_try = true)]
+    async fn test_read_write() {
+        let store = crate::TestDb::create_persistent_store(None).await;
+        let conn = store.conn();
+        let mls_store = SqlKeyStore::new(conn);
+        let provider = XmtpOpenMlsProvider::new(mls_store);
+        let key_store = provider.key_store();
+
+        let raw_value = vec![3u8; 32];
+        let group_1 = bincode::serialize(&[1u8; 32])?;
+        let group_2 = bincode::serialize(&[2u8; 32])?;
+        let value_1 = bincode::serialize(&raw_value)?;
+
+        key_store.write::<CURRENT_VERSION>(
+            crate::sql_key_store::COMMIT_LOG_SIGNER_PRIVATE_KEY,
+            &group_1,
+            &value_1,
+        )?;
+
+        // Query on a value that hasn't been written
+        let result = key_store.read::<CURRENT_VERSION, Vec<u8>>(
+            crate::sql_key_store::COMMIT_LOG_SIGNER_PRIVATE_KEY,
+            &group_2,
+        );
+        assert!(result.is_ok(), "{}", result.err().unwrap());
+        assert!(result.unwrap().is_none());
+
+        let result = key_store.read::<CURRENT_VERSION, Vec<u8>>(
+            crate::sql_key_store::COMMIT_LOG_SIGNER_PRIVATE_KEY,
+            &group_1,
+        );
+        assert!(result.is_ok(), "{}", result.err().unwrap());
+        assert_eq!(result.unwrap(), Some(raw_value));
+    }
 
     #[xmtp_common::test]
     async fn list_append_remove() {

@@ -35,6 +35,7 @@ use xmtp_api_d14n::queries::D14nClient;
 use xmtp_api_grpc::grpc_client::GrpcClient;
 use xmtp_api_grpc::{grpc_api_helper::Client as ClientV3, GrpcError};
 use xmtp_common::time::now_ns;
+use xmtp_configuration::DeviceSyncUrls;
 use xmtp_content_types::{text::TextCodec, ContentCodec};
 use xmtp_cryptography::signature::IdentifierValidationError;
 use xmtp_cryptography::signature::SignatureError;
@@ -47,7 +48,6 @@ use xmtp_db::{
 };
 use xmtp_id::associations::unverified::UnverifiedSignature;
 use xmtp_id::associations::{AssociationError, AssociationState, Identifier, MemberKind};
-use xmtp_mls::configuration::DeviceSyncUrls;
 use xmtp_mls::context::XmtpMlsLocalContext;
 use xmtp_mls::context::XmtpSharedContext;
 use xmtp_mls::groups::device_sync_legacy::DeviceSyncContent;
@@ -238,12 +238,15 @@ async fn main() -> color_eyre::eyre::Result<()> {
 
     let grpc: XmtpApiClient = match (cli.testnet, &cli.env) {
         (true, Env::Local) => {
-            let mut client = GrpcClient::builder();
-            client.set_host("http://localhost:5050".into());
-            client.set_tls(false);
-            let client = client.build().await?;
-
-            Arc::new(D14nClient::new(client.clone(), client))
+            let mut message = GrpcClient::builder();
+            message.set_host("http://localhost:5050".into());
+            message.set_tls(false);
+            let message = message.build().await?;
+            let mut payer = GrpcClient::builder();
+            payer.set_host("http://localhost:5052".into());
+            payer.set_tls(false);
+            let payer = payer.build().await?;
+            Arc::new(D14nClient::new(message, payer))
         }
         (true, Env::Production) => {
             let mut message = GrpcClient::builder();
@@ -536,7 +539,7 @@ async fn create_client<C: XmtpApi + Clone + 'static>(
 > {
     let msg_store = get_encrypted_store(&cli.db).await?;
     let builder = xmtp_mls::Client::builder(account).store(msg_store);
-    let mut builder = builder.api_client(grpc);
+    let mut builder = builder.api_clients(grpc.clone(), grpc);
 
     builder = match (cli.testnet, &cli.env) {
         (false, Env::Local) => builder.device_sync_server_url(DeviceSyncUrls::LOCAL_ADDRESS),

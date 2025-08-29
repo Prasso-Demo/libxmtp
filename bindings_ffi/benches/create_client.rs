@@ -16,7 +16,7 @@ use xmtpv3::identity::FfiIdentifier;
 #[macro_use]
 extern crate tracing;
 
-const HISTORY_SYNC_URL: &str = xmtp_mls::configuration::DeviceSyncUrls::LOCAL_ADDRESS;
+const HISTORY_SYNC_URL: &str = xmtp_configuration::DeviceSyncUrls::LOCAL_ADDRESS;
 
 fn setup() -> Runtime {
     Builder::new_multi_thread()
@@ -32,9 +32,9 @@ fn network_url() -> (String, bool) {
     let is_dev_network = matches!(dev, Ok(d) if d == "true" || d == "1");
 
     if is_dev_network {
-        (xmtp_api_grpc::DEV_ADDRESS.to_string(), true)
+        (xmtp_configuration::GrpcUrls::NODE_DEV.to_string(), true)
     } else {
-        (xmtp_api_grpc::LOCALHOST_ADDRESS.to_string(), false)
+        (xmtp_configuration::GrpcUrls::NODE.to_string(), false)
     }
 }
 
@@ -58,11 +58,15 @@ fn create_ffi_client(c: &mut Criterion) {
                     let inbox_id = ident.inbox_id(nonce).unwrap();
                     let path = tmp_path();
                     let (url, is_secure) = network_url();
-                    let api = xmtpv3::mls::connect_to_backend(url, is_secure, None)
+                    let api = xmtpv3::mls::connect_to_backend(url.clone(), is_secure, None)
+                        .await
+                        .unwrap();
+                    let sync_api = xmtpv3::mls::connect_to_backend(url, is_secure, None)
                         .await
                         .unwrap();
                     (
                         api,
+                        sync_api,
                         inbox_id,
                         wallet.identifier(),
                         nonce,
@@ -71,10 +75,11 @@ fn create_ffi_client(c: &mut Criterion) {
                     )
                 })
             },
-            |(api, inbox_id, ident, nonce, path, span)| async move {
+            |(api, sync_api, inbox_id, ident, nonce, path, span)| async move {
                 let ffi_ident: FfiIdentifier = ident.into();
                 xmtpv3::mls::create_client(
                     api,
+                    sync_api,
                     Some(path),
                     Some(vec![0u8; 32]),
                     &inbox_id,
@@ -118,6 +123,7 @@ fn cached_create_ffi_client(c: &mut Criterion) {
             .unwrap();
         xmtpv3::mls::create_client(
             api.clone(),
+            api.clone(),
             Some(path.clone()),
             Some(vec![0u8; 32]),
             &inbox_id.clone(),
@@ -152,6 +158,7 @@ fn cached_create_ffi_client(c: &mut Criterion) {
             |(api, inbox_id, ident, nonce, path, history_sync, span)| async move {
                 let ffi_ident: FfiIdentifier = ident.into();
                 xmtpv3::mls::create_client(
+                    api.clone(),
                     api,
                     Some(path),
                     Some(vec![0u8; 32]),

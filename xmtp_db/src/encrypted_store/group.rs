@@ -84,6 +84,22 @@ pub struct StoredGroup {
     /// Whether the user should publish the commit log for this group
     #[builder(default = false)]
     pub should_publish_commit_log: bool,
+    /// The consensus public key of the commit log for this group
+    /// Derived from the first entry of the commit log
+    #[builder(default = None)]
+    pub commit_log_public_key: Option<Vec<u8>>,
+    /// Whether the local commit log has diverged from the remote commit log
+    /// NULL if the remote commit log is not up to date yet
+    #[builder(default = None)]
+    pub is_commit_log_forked: Option<bool>,
+}
+
+/// A subset of the group table for fetching the commit log public key
+#[derive(Queryable)]
+#[diesel(table_name = groups)]
+pub struct StoredGroupCommitLogPublicKey {
+    pub id: Vec<u8>,
+    pub commit_log_public_key: Option<Vec<u8>>,
 }
 
 // TODO: Create two more structs that delegate to StoredGroup
@@ -106,8 +122,8 @@ impl StoredGroup {
         StoredGroupBuilder::default()
     }
 
-    pub fn create_sync_group<C: ConnectionExt>(
-        conn: &impl crate::DbQuery<C>,
+    pub fn create_sync_group(
+        conn: &impl crate::DbQuery,
         id: ID,
         created_at_ns: i64,
         membership_state: GroupMembershipState,
@@ -147,7 +163,7 @@ impl AsRef<GroupQueryArgs> for GroupQueryArgs {
     }
 }
 
-pub trait QueryGroup<C: ConnectionExt> {
+pub trait QueryGroup {
     /// Return regular [`Purpose::Conversation`] groups with additional optional filters
     fn find_groups<A: AsRef<GroupQueryArgs>>(
         &self,
@@ -219,16 +235,207 @@ pub trait QueryGroup<C: ConnectionExt> {
 
     fn has_duplicate_dm(&self, group_id: &[u8]) -> Result<bool, crate::ConnectionError>;
 
-    /// Get conversation IDs for all conversations that require a remote commit log publish (DMs and groups where user is super admin, excluding sync groups)
-    fn get_conversation_ids_for_remote_log(&self) -> Result<Vec<Vec<u8>>, crate::ConnectionError>;
+    /// Get conversations for all conversations that require a remote commit log publish (DMs and groups where user is super admin, excluding sync groups)
+    fn get_conversation_ids_for_remote_log_publish(
+        &self,
+    ) -> Result<Vec<StoredGroupCommitLogPublicKey>, crate::ConnectionError>;
+
+    /// Get conversations for all conversations that require a remote commit log download (DMs and groups that are not sync groups)
+    fn get_conversation_ids_for_remote_log_download(
+        &self,
+    ) -> Result<Vec<StoredGroupCommitLogPublicKey>, crate::ConnectionError>;
+
+    /// Get conversation IDs for fork checking (excludes already forked conversations and sync groups)
+    fn get_conversation_ids_for_fork_check(&self) -> Result<Vec<Vec<u8>>, crate::ConnectionError>;
 
     fn get_conversation_type(
         &self,
         group_id: &[u8],
     ) -> Result<ConversationType, crate::ConnectionError>;
+
+    /// Updates the commit log public key for a group
+    fn set_group_commit_log_public_key(
+        &self,
+        group_id: &[u8],
+        public_key: &[u8],
+    ) -> Result<(), StorageError>;
+
+    /// Updates the is_commit_log_forked status for a group
+    fn set_group_commit_log_forked_status(
+        &self,
+        group_id: &[u8],
+        is_forked: Option<bool>,
+    ) -> Result<(), StorageError>;
+
+    /// Gets the is_commit_log_forked status for a group
+    fn get_group_commit_log_forked_status(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Option<bool>, StorageError>;
 }
 
-impl<C: ConnectionExt> QueryGroup<C> for DbConnection<C> {
+impl<T> QueryGroup for &T
+where
+    T: QueryGroup,
+{
+    /// Return regular [`Purpose::Conversation`] groups with additional optional filters
+    fn find_groups<A: AsRef<GroupQueryArgs>>(
+        &self,
+        args: A,
+    ) -> Result<Vec<StoredGroup>, crate::ConnectionError> {
+        (**self).find_groups(args)
+    }
+
+    fn find_groups_by_id_paged<A: AsRef<GroupQueryArgs>>(
+        &self,
+        args: A,
+        offset: i64,
+    ) -> Result<Vec<StoredGroup>, crate::ConnectionError> {
+        (**self).find_groups_by_id_paged(args, offset)
+    }
+
+    /// Updates group membership state
+    fn update_group_membership<GroupId: AsRef<[u8]>>(
+        &self,
+        group_id: GroupId,
+        state: GroupMembershipState,
+    ) -> Result<(), crate::ConnectionError> {
+        (**self).update_group_membership(group_id, state)
+    }
+
+    fn all_sync_groups(&self) -> Result<Vec<StoredGroup>, crate::ConnectionError> {
+        (**self).all_sync_groups()
+    }
+
+    fn find_sync_group(&self, id: &[u8]) -> Result<Option<StoredGroup>, crate::ConnectionError> {
+        (**self).find_sync_group(id)
+    }
+
+    fn primary_sync_group(&self) -> Result<Option<StoredGroup>, crate::ConnectionError> {
+        (**self).primary_sync_group()
+    }
+
+    /// Return a single group that matches the given ID
+    fn find_group(&self, id: &[u8]) -> Result<Option<StoredGroup>, crate::ConnectionError> {
+        (**self).find_group(id)
+    }
+
+    /// Return a single group that matches the given welcome ID
+    fn find_group_by_welcome_id(
+        &self,
+        welcome_id: i64,
+    ) -> Result<Option<StoredGroup>, crate::ConnectionError> {
+        (**self).find_group_by_welcome_id(welcome_id)
+    }
+
+    fn get_rotated_at_ns(&self, group_id: Vec<u8>) -> Result<i64, StorageError> {
+        (**self).get_rotated_at_ns(group_id)
+    }
+
+    /// Updates the 'last time checked' we checked for new installations.
+    fn update_rotated_at_ns(&self, group_id: Vec<u8>) -> Result<(), StorageError> {
+        (**self).update_rotated_at_ns(group_id)
+    }
+
+    fn get_installations_time_checked(&self, group_id: Vec<u8>) -> Result<i64, StorageError> {
+        (**self).get_installations_time_checked(group_id)
+    }
+
+    /// Updates the 'last time checked' we checked for new installations.
+    fn update_installations_time_checked(&self, group_id: Vec<u8>) -> Result<(), StorageError> {
+        (**self).update_installations_time_checked(group_id)
+    }
+
+    fn update_message_disappearing_from_ns(
+        &self,
+        group_id: Vec<u8>,
+        from_ns: Option<i64>,
+    ) -> Result<(), StorageError> {
+        (**self).update_message_disappearing_from_ns(group_id, from_ns)
+    }
+
+    fn update_message_disappearing_in_ns(
+        &self,
+        group_id: Vec<u8>,
+        in_ns: Option<i64>,
+    ) -> Result<(), StorageError> {
+        (**self).update_message_disappearing_in_ns(group_id, in_ns)
+    }
+
+    fn insert_or_replace_group(&self, group: StoredGroup) -> Result<StoredGroup, StorageError> {
+        (**self).insert_or_replace_group(group)
+    }
+
+    /// Get all the welcome ids turned into groups
+    fn group_welcome_ids(&self) -> Result<Vec<i64>, crate::ConnectionError> {
+        (**self).group_welcome_ids()
+    }
+
+    fn mark_group_as_maybe_forked(
+        &self,
+        group_id: &[u8],
+        fork_details: String,
+    ) -> Result<(), StorageError> {
+        (**self).mark_group_as_maybe_forked(group_id, fork_details)
+    }
+
+    fn clear_fork_flag_for_group(&self, group_id: &[u8]) -> Result<(), crate::ConnectionError> {
+        (**self).clear_fork_flag_for_group(group_id)
+    }
+
+    fn has_duplicate_dm(&self, group_id: &[u8]) -> Result<bool, crate::ConnectionError> {
+        (**self).has_duplicate_dm(group_id)
+    }
+
+    /// Get conversation IDs for all conversations that require a remote commit log publish (DMs and groups where user is super admin, excluding sync groups)
+    fn get_conversation_ids_for_remote_log_publish(
+        &self,
+    ) -> Result<Vec<StoredGroupCommitLogPublicKey>, crate::ConnectionError> {
+        (**self).get_conversation_ids_for_remote_log_publish()
+    }
+
+    fn get_conversation_ids_for_remote_log_download(
+        &self,
+    ) -> Result<Vec<StoredGroupCommitLogPublicKey>, crate::ConnectionError> {
+        (**self).get_conversation_ids_for_remote_log_download()
+    }
+
+    fn get_conversation_ids_for_fork_check(&self) -> Result<Vec<Vec<u8>>, crate::ConnectionError> {
+        (**self).get_conversation_ids_for_fork_check()
+    }
+
+    fn get_conversation_type(
+        &self,
+        group_id: &[u8],
+    ) -> Result<ConversationType, crate::ConnectionError> {
+        (**self).get_conversation_type(group_id)
+    }
+
+    fn set_group_commit_log_public_key(
+        &self,
+        group_id: &[u8],
+        public_key: &[u8],
+    ) -> Result<(), StorageError> {
+        (**self).set_group_commit_log_public_key(group_id, public_key)
+    }
+
+    fn set_group_commit_log_forked_status(
+        &self,
+        group_id: &[u8],
+        is_forked: Option<bool>,
+    ) -> Result<(), StorageError> {
+        (**self).set_group_commit_log_forked_status(group_id, is_forked)
+    }
+
+    fn get_group_commit_log_forked_status(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Option<bool>, StorageError> {
+        (**self).get_group_commit_log_forked_status(group_id)
+    }
+}
+
+impl<C: ConnectionExt> QueryGroup for DbConnection<C> {
     /// Return regular [`Purpose::Conversation`] groups with additional optional filters
     fn find_groups<A: AsRef<GroupQueryArgs>>(
         &self,
@@ -539,7 +746,6 @@ impl<C: ConnectionExt> QueryGroup<C> for DbConnection<C> {
     }
 
     fn insert_or_replace_group(&self, group: StoredGroup) -> Result<StoredGroup, StorageError> {
-        tracing::info!("Trying to insert group");
         let maybe_inserted_group: Option<StoredGroup> = self.raw_query_write(|conn| {
             diesel::insert_into(dsl::groups)
                 .values(&group)
@@ -586,7 +792,6 @@ impl<C: ConnectionExt> QueryGroup<C> for DbConnection<C> {
                 Ok(existing_group)
             }
         } else {
-            tracing::info!("Group is inserted");
             Ok(self.raw_query_read(|c| dsl::groups.find(group.id).first(c))?)
         }
     }
@@ -653,7 +858,13 @@ impl<C: ConnectionExt> QueryGroup<C> for DbConnection<C> {
         })
     }
 
-    fn get_conversation_ids_for_remote_log(&self) -> Result<Vec<Vec<u8>>, crate::ConnectionError> {
+    /// Get conversation IDs for all conversations that require a remote commit log publish
+    /// (DMs and groups where user is super admin, excluding sync groups and rejected groups)
+    fn get_conversation_ids_for_remote_log_publish(
+        &self,
+    ) -> Result<Vec<StoredGroupCommitLogPublicKey>, crate::ConnectionError> {
+        use crate::schema::consent_records::dsl as consent_dsl;
+
         let query = dsl::groups
             .filter(
                 dsl::conversation_type
@@ -662,8 +873,44 @@ impl<C: ConnectionExt> QueryGroup<C> for DbConnection<C> {
                         .eq(ConversationType::Group)
                         .and(dsl::should_publish_commit_log.eq(true))),
             )
-            .select(dsl::id)
+            .inner_join(consent_dsl::consent_records.on(
+                sql::<diesel::sql_types::Text>("lower(hex(groups.id))").eq(consent_dsl::entity),
+            ))
+            .filter(consent_dsl::state.eq(ConsentState::Allowed))
+            .select((dsl::id, dsl::commit_log_public_key))
             .order(dsl::created_at_ns.asc());
+
+        self.raw_query_read(|conn| query.load::<StoredGroupCommitLogPublicKey>(conn))
+    }
+
+    // All dms and groups that are not sync groups and have consent state Allowed
+    fn get_conversation_ids_for_remote_log_download(
+        &self,
+    ) -> Result<Vec<StoredGroupCommitLogPublicKey>, crate::ConnectionError> {
+        use crate::schema::consent_records::dsl as consent_dsl;
+
+        let query = dsl::groups
+            .filter(dsl::conversation_type.ne(ConversationType::Sync))
+            .inner_join(consent_dsl::consent_records.on(
+                sql::<diesel::sql_types::Text>("lower(hex(groups.id))").eq(consent_dsl::entity),
+            ))
+            .filter(consent_dsl::state.eq(ConsentState::Allowed))
+            .select((dsl::id, dsl::commit_log_public_key));
+
+        self.raw_query_read(|conn| query.load::<StoredGroupCommitLogPublicKey>(conn))
+    }
+
+    // Get conversation IDs for fork checking (excludes already forked conversations and sync groups)
+    fn get_conversation_ids_for_fork_check(&self) -> Result<Vec<Vec<u8>>, crate::ConnectionError> {
+        let query = dsl::groups
+            .filter(
+                dsl::conversation_type.ne(ConversationType::Sync).and(
+                    dsl::is_commit_log_forked
+                        .is_null()
+                        .or(dsl::is_commit_log_forked.ne(Some(true))),
+                ),
+            )
+            .select(dsl::id);
 
         self.raw_query_read(|conn| query.load::<Vec<u8>>(conn))
     }
@@ -677,6 +924,58 @@ impl<C: ConnectionExt> QueryGroup<C> for DbConnection<C> {
             .select(dsl::conversation_type);
         let conversation_type = self.raw_query_read(|conn| query.first(conn))?;
         Ok(conversation_type)
+    }
+
+    fn set_group_commit_log_public_key(
+        &self,
+        group_id: &[u8],
+        public_key: &[u8],
+    ) -> Result<(), StorageError> {
+        use crate::schema::groups::dsl;
+        let num_updated = self.raw_query_write(|conn| {
+            diesel::update(dsl::groups)
+                .filter(
+                    dsl::id
+                        .eq(group_id)
+                        .and(dsl::commit_log_public_key.is_null()),
+                )
+                .set(dsl::commit_log_public_key.eq(public_key))
+                .execute(conn)
+        })?;
+        if num_updated == 0 {
+            return Err(StorageError::Duplicate(DuplicateItem::CommitLogPublicKey(
+                group_id.to_vec(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn set_group_commit_log_forked_status(
+        &self,
+        group_id: &[u8],
+        is_forked: Option<bool>,
+    ) -> Result<(), StorageError> {
+        use crate::schema::groups::dsl;
+        self.raw_query_write(|conn| {
+            diesel::update(dsl::groups.find(group_id))
+                .set(dsl::is_commit_log_forked.eq(is_forked))
+                .execute(conn)
+        })?;
+        Ok(())
+    }
+
+    fn get_group_commit_log_forked_status(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Option<bool>, StorageError> {
+        use crate::schema::groups::dsl;
+        self.raw_query_read(|conn| {
+            dsl::groups
+                .find(group_id)
+                .select(dsl::is_commit_log_forked)
+                .first::<Option<bool>>(conn)
+        })
+        .map_err(StorageError::from)
     }
 }
 
@@ -1227,6 +1526,137 @@ pub(crate) mod tests {
             assert!(returned_ids.contains(&&allowed_group.id));
             assert!(returned_ids.contains(&&unknown_group.id));
             assert!(!returned_ids.contains(&&denied_group.id));
+        })
+        .await
+    }
+
+    #[xmtp_common::test(unwrap_try = true)]
+    async fn test_get_conversation_ids_for_remote_log_publish() {
+        with_connection(|conn| {
+            let mut group1 = generate_group(None);
+            let mut group2 = generate_group(None);
+            let mut group3 = generate_group(None);
+            let mut group4 = generate_group(None);
+            group1.should_publish_commit_log = true;
+            group1.commit_log_public_key = None;
+            generate_consent_record(
+                ConsentType::ConversationId,
+                ConsentState::Allowed,
+                hex::encode(group1.id.clone()),
+            )
+            .store(conn)?;
+            group2.should_publish_commit_log = true;
+            group2.commit_log_public_key = Some(rand_vec::<32>());
+
+            group3.should_publish_commit_log = true;
+            group3.commit_log_public_key = Some(rand_vec::<32>());
+            generate_consent_record(
+                ConsentType::ConversationId,
+                ConsentState::Allowed,
+                hex::encode(group3.id.clone()),
+            )
+            .store(conn)?;
+            group4.should_publish_commit_log = false;
+            group1.store(conn)?;
+            group2.store(conn)?;
+            group3.store(conn)?;
+            group4.store(conn)?;
+
+            let commit_log_keys = conn.get_conversation_ids_for_remote_log_publish().unwrap();
+            assert_eq!(commit_log_keys.len(), 2);
+            assert_eq!(commit_log_keys[0].id, group1.id);
+            assert_eq!(commit_log_keys[1].id, group3.id);
+            assert_eq!(commit_log_keys[0].commit_log_public_key, None);
+            assert_eq!(
+                commit_log_keys[1].commit_log_public_key,
+                group3.commit_log_public_key
+            );
+        })
+        .await
+    }
+
+    #[xmtp_common::test]
+    async fn test_get_conversation_ids_for_remote_log_publish_with_consent() {
+        with_connection(|conn| {
+            // Create groups: one with Allowed consent, one with Denied consent, one with no consent
+            let mut allowed_group = generate_group(None);
+            allowed_group.should_publish_commit_log = true;
+            allowed_group.store(conn).unwrap();
+
+            let mut denied_group = generate_group(None);
+            denied_group.should_publish_commit_log = true;
+            denied_group.store(conn).unwrap();
+
+            let mut no_consent_group = generate_group(None);
+            no_consent_group.should_publish_commit_log = true;
+            no_consent_group.store(conn).unwrap();
+
+            // Create consent records
+            let allowed_consent = generate_consent_record(
+                ConsentType::ConversationId,
+                ConsentState::Allowed,
+                hex::encode(allowed_group.id.clone()),
+            );
+            allowed_consent.store(conn).unwrap();
+
+            let denied_consent = generate_consent_record(
+                ConsentType::ConversationId,
+                ConsentState::Denied,
+                hex::encode(denied_group.id.clone()),
+            );
+            denied_consent.store(conn).unwrap();
+
+            // Function should only return groups with Allowed consent state
+            let commit_log_keys = conn.get_conversation_ids_for_remote_log_publish().unwrap();
+            assert_eq!(commit_log_keys.len(), 1);
+            assert_eq!(commit_log_keys[0].id, allowed_group.id);
+        })
+        .await
+    }
+
+    #[xmtp_common::test]
+    async fn test_get_conversation_ids_for_remote_log_download_with_consent() {
+        with_connection(|conn| {
+            // Create groups: one with Allowed consent, one with Denied consent, one with no consent
+            let allowed_group = generate_group(None);
+            allowed_group.store(conn).unwrap();
+
+            let denied_group = generate_group(None);
+            denied_group.store(conn).unwrap();
+
+            let no_consent_group = generate_group(None);
+            no_consent_group.store(conn).unwrap();
+
+            // Create a sync group (should be excluded regardless of consent)
+            let mut sync_group = generate_group(None);
+            sync_group.conversation_type = ConversationType::Sync;
+            sync_group.store(conn).unwrap();
+            let sync_consent = generate_consent_record(
+                ConsentType::ConversationId,
+                ConsentState::Allowed,
+                hex::encode(sync_group.id.clone()),
+            );
+            sync_consent.store(conn).unwrap();
+
+            // Create consent records
+            let allowed_consent = generate_consent_record(
+                ConsentType::ConversationId,
+                ConsentState::Allowed,
+                hex::encode(allowed_group.id.clone()),
+            );
+            allowed_consent.store(conn).unwrap();
+
+            let denied_consent = generate_consent_record(
+                ConsentType::ConversationId,
+                ConsentState::Denied,
+                hex::encode(denied_group.id.clone()),
+            );
+            denied_consent.store(conn).unwrap();
+
+            // Function should only return groups with Allowed consent state, excluding sync groups
+            let conversation_ids = conn.get_conversation_ids_for_remote_log_download().unwrap();
+            assert_eq!(conversation_ids.len(), 1);
+            assert_eq!(conversation_ids[0].id, allowed_group.id);
         })
         .await
     }

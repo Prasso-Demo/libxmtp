@@ -32,6 +32,8 @@
 , wasm-pack
 , binaryen
 , emscripten
+, taplo
+, shellcheck
 , ...
 }:
 
@@ -67,6 +69,7 @@ mkShell {
       zstd
       emscripten
 
+      # Misc tools
       mktemp
       jdk21
       kotlin
@@ -90,6 +93,11 @@ mkShell {
       protobuf
       protolint
 
+
+      # lint
+      taplo
+      # dev/up
+      shellcheck
       # yarn/nodejs
       corepack
     ]

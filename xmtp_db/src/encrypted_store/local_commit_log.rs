@@ -38,9 +38,9 @@ pub struct NewLocalCommitLog {
     pub commit_sequence_id: i64,
     pub last_epoch_authenticator: Vec<u8>,
     pub commit_result: CommitResult,
-    pub error_message: Option<String>,
     pub applied_epoch_number: i64,
     pub applied_epoch_authenticator: Vec<u8>,
+    pub error_message: Option<String>,
     pub sender_inbox_id: Option<String>,
     pub sender_installation_id: Option<Vec<u8>>,
     pub commit_type: Option<String>,
@@ -55,9 +55,9 @@ pub struct LocalCommitLog {
     pub commit_sequence_id: i64,
     pub last_epoch_authenticator: Vec<u8>,
     pub commit_result: CommitResult,
-    pub error_message: Option<String>,
     pub applied_epoch_number: i64,
     pub applied_epoch_authenticator: Vec<u8>,
+    pub error_message: Option<String>,
     pub sender_inbox_id: Option<String>,
     pub sender_installation_id: Option<Vec<u8>>,
     pub commit_type: Option<String>,
@@ -120,7 +120,12 @@ impl std::fmt::Debug for LocalCommitLog {
     }
 }
 
-pub trait QueryLocalCommitLog<C: ConnectionExt> {
+pub enum LocalCommitLogOrder {
+    AscendingByRowid,
+    DescendingByRowid,
+}
+
+pub trait QueryLocalCommitLog {
     fn get_group_logs(
         &self,
         group_id: &[u8],
@@ -128,10 +133,11 @@ pub trait QueryLocalCommitLog<C: ConnectionExt> {
 
     // Local commit log entries are returned sorted in ascending order of `rowid`
     // Entries with `commit_sequence_id` = 0 should not be published to the remote commit log
-    fn get_group_logs_for_publishing(
+    fn get_local_commit_log_after_cursor(
         &self,
         group_id: &[u8],
         after_cursor: i64,
+        order_by: LocalCommitLogOrder,
     ) -> Result<Vec<LocalCommitLog>, crate::ConnectionError>;
 
     fn get_latest_log_for_group(
@@ -145,7 +151,42 @@ pub trait QueryLocalCommitLog<C: ConnectionExt> {
     ) -> Result<Option<i32>, crate::ConnectionError>;
 }
 
-impl<C: ConnectionExt> QueryLocalCommitLog<C> for DbConnection<C> {
+impl<T> QueryLocalCommitLog for &T
+where
+    T: QueryLocalCommitLog,
+{
+    fn get_group_logs(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Vec<LocalCommitLog>, crate::ConnectionError> {
+        (**self).get_group_logs(group_id)
+    }
+
+    fn get_local_commit_log_after_cursor(
+        &self,
+        group_id: &[u8],
+        after_cursor: i64,
+        order_by: LocalCommitLogOrder,
+    ) -> Result<Vec<LocalCommitLog>, crate::ConnectionError> {
+        (**self).get_local_commit_log_after_cursor(group_id, after_cursor, order_by)
+    }
+
+    fn get_latest_log_for_group(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Option<LocalCommitLog>, crate::ConnectionError> {
+        (**self).get_latest_log_for_group(group_id)
+    }
+
+    fn get_local_commit_log_cursor(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Option<i32>, crate::ConnectionError> {
+        (**self).get_local_commit_log_cursor(group_id)
+    }
+}
+
+impl<C: ConnectionExt> QueryLocalCommitLog for DbConnection<C> {
     fn get_group_logs(
         &self,
         group_id: &[u8],
@@ -158,12 +199,13 @@ impl<C: ConnectionExt> QueryLocalCommitLog<C> for DbConnection<C> {
         })
     }
 
-    // Local commit log entries are returned sorted in ascending order of `rowid`
+    // Local commit log entries are sorted by `rowid`
     // Entries with `commit_sequence_id` = 0 should not be published to the remote commit log
-    fn get_group_logs_for_publishing(
+    fn get_local_commit_log_after_cursor(
         &self,
         group_id: &[u8],
         after_cursor: i64,
+        order: LocalCommitLogOrder,
     ) -> Result<Vec<LocalCommitLog>, crate::ConnectionError> {
         // i64 cursor is populated by i32 local_commit_log rowid value, so we should never hit this error
         if after_cursor > i32::MAX as i64 {
@@ -173,13 +215,14 @@ impl<C: ConnectionExt> QueryLocalCommitLog<C> for DbConnection<C> {
         }
         let after_cursor = after_cursor as i32;
 
-        self.raw_query_read(|db| {
-            dsl::local_commit_log
-                .filter(dsl::group_id.eq(group_id))
-                .filter(dsl::rowid.gt(after_cursor))
-                .filter(dsl::commit_sequence_id.ne(0))
-                .order_by(dsl::rowid.asc())
-                .load(db)
+        let query = dsl::local_commit_log
+            .filter(dsl::group_id.eq(group_id))
+            .filter(dsl::rowid.gt(after_cursor))
+            .filter(dsl::commit_sequence_id.ne(0));
+
+        self.raw_query_read(|db| match order {
+            LocalCommitLogOrder::AscendingByRowid => query.order_by(dsl::rowid.asc()).load(db),
+            LocalCommitLogOrder::DescendingByRowid => query.order_by(dsl::rowid.desc()).load(db),
         })
     }
 

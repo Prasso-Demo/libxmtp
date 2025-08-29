@@ -4,7 +4,7 @@ use crate::builder::ClientBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use xmtp_cryptography::utils::generate_local_wallet;
-use xmtp_id::associations::{test_utils::WalletTestExt, Identifier};
+use xmtp_id::associations::{Identifier, test_utils::WalletTestExt};
 
 use super::{BenchClient, BenchError};
 
@@ -91,10 +91,10 @@ async fn create_identities(n: usize, is_dev_network: bool) -> Vec<Identity> {
 
         // going above 128 we hit "unable to open database errors"
         // This may be related to open file limits
-        if set.len() == 128 {
-            if let Some(Ok(identity)) = set.join_next().await {
-                identities.push(identity);
-            }
+        if set.len() == 128
+            && let Some(Ok(identity)) = set.join_next().await
+        {
+            identities.push(identity);
         }
     }
 

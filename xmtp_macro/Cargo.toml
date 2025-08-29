@@ -4,10 +4,11 @@ edition = "2024"
 license.workspace = true
 version.workspace = true
 
-[lints.clippy]
-uninlined_format_args = "allow"
+[lints]
+workspace = true
 
 [dependencies]
+num_cpus = "1.17"
 proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "2.0", default-features = false, features = [

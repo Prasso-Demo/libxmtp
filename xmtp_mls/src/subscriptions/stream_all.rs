@@ -4,7 +4,7 @@ mod tests;
 use std::{
     borrow::Cow,
     pin::Pin,
-    task::{ready, Poll},
+    task::{Poll, ready},
 };
 
 use crate::{context::XmtpSharedContext, subscriptions::stream_messages::MessagesApiSubscription};
@@ -17,9 +17,9 @@ use xmtp_db::{
 use xmtp_proto::api_client::XmtpMlsStreams;
 
 use super::{
+    Result, SubscribeError,
     stream_conversations::{StreamConversations, WelcomesApiSubscription},
     stream_messages::StreamGroupMessages,
-    Result, SubscribeError,
 };
 use crate::groups::MlsGroup;
 use crate::subscriptions::SyncWorkerEvent;
@@ -132,6 +132,7 @@ where
         let conversations = super::stream_conversations::StreamConversations::from_cow(
             context.clone(),
             conversation_type,
+            true,
         )
         .await?;
         let messages = StreamGroupMessages::from_cow(context.clone(), active_conversations).await?;
@@ -170,15 +171,15 @@ where
 
         let next_message = this.messages.as_mut().poll_next(cx);
         if let Ready(Some(msg)) = next_message {
-            if let Ok(msg) = &msg {
-                if self.sync_groups.contains(&msg.group_id) {
-                    let _ = self
-                        .context
-                        .worker_events()
-                        .send(SyncWorkerEvent::NewSyncGroupMsg);
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
+            if let Ok(msg) = &msg
+                && self.sync_groups.contains(&msg.group_id)
+            {
+                let _ = self
+                    .context
+                    .worker_events()
+                    .send(SyncWorkerEvent::NewSyncGroupMsg);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
             return Ready(Some(msg));
         }

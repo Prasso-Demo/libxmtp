@@ -21,20 +21,20 @@ pub(crate) mod stream_messages;
 mod stream_utils;
 
 use crate::{
+    Client,
     context::XmtpSharedContext,
     groups::{
-        device_sync::preference_sync::PreferenceUpdate, mls_sync::GroupMessageProcessingError,
-        GroupError, MlsGroup,
+        GroupError, MlsGroup, device_sync::preference_sync::PreferenceUpdate,
+        mls_sync::GroupMessageProcessingError,
     },
-    Client,
 };
 use thiserror::Error;
-use xmtp_common::{retryable, RetryableError, StreamHandle};
+use xmtp_common::{RetryableError, StreamHandle, retryable};
 use xmtp_db::{
+    NotFound, StorageError,
     consent_record::{ConsentState, StoredConsentRecord},
     group::ConversationType,
     group_message::StoredGroupMessage,
-    NotFound, StorageError,
 };
 
 pub(crate) type Result<T> = std::result::Result<T, SubscribeError>;
@@ -60,7 +60,7 @@ pub enum LocalEvents {
     PreferencesChanged(Vec<PreferenceUpdate>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SyncWorkerEvent {
     NewSyncGroupFromWelcome(Vec<u8>),
     NewSyncGroupMsg,
@@ -71,6 +71,28 @@ pub enum SyncWorkerEvent {
     // TODO: Device Sync V1 below - Delete when V1 is deleted
     Request { message_id: Vec<u8> },
     Reply { message_id: Vec<u8> },
+}
+
+impl std::fmt::Debug for SyncWorkerEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewSyncGroupFromWelcome(arg0) => f
+                .debug_tuple("NewSyncGroupFromWelcome")
+                .field(&hex::encode(arg0))
+                .finish(),
+            Self::NewSyncGroupMsg => write!(f, "NewSyncGroupMsg"),
+            Self::SyncPreferences(arg0) => f.debug_tuple("SyncPreferences").field(arg0).finish(),
+            Self::CycleHMAC => write!(f, "CycleHMAC"),
+            Self::Request { message_id } => f
+                .debug_struct("Request")
+                .field("message_id", message_id)
+                .finish(),
+            Self::Reply { message_id } => f
+                .debug_struct("Reply")
+                .field("message_id", message_id)
+                .finish(),
+        }
+    }
 }
 
 impl LocalEvents {
@@ -220,6 +242,7 @@ where
             self.context.clone(),
             WelcomeOrGroup::Welcome(envelope),
             None,
+            false,
         )?;
         match future.process().await? {
             ProcessWelcomeResult::New { group, .. } => Ok(group),
@@ -234,11 +257,12 @@ where
     pub async fn stream_conversations(
         &self,
         conversation_type: Option<ConversationType>,
+        include_duplicate_dms: bool,
     ) -> Result<impl Stream<Item = Result<MlsGroup<Context>>> + use<'_, Context>>
     where
         Context::ApiClient: XmtpMlsStreams,
     {
-        StreamConversations::new(&self.context, conversation_type).await
+        StreamConversations::new(&self.context, conversation_type, include_duplicate_dms).await
     }
 
     /// Stream conversations but decouple the lifetime of 'self' from the stream.
@@ -246,11 +270,17 @@ where
     pub async fn stream_conversations_owned(
         &self,
         conversation_type: Option<ConversationType>,
+        include_duplicate_dms: bool,
     ) -> Result<impl Stream<Item = Result<MlsGroup<Context>>> + 'static>
     where
         Context::ApiClient: XmtpMlsStreams,
     {
-        StreamConversations::new_owned(self.context.clone(), conversation_type).await
+        StreamConversations::new_owned(
+            self.context.clone(),
+            conversation_type,
+            include_duplicate_dms,
+        )
+        .await
     }
 }
 
@@ -264,17 +294,28 @@ where
         client: Arc<Client<Context>>,
         conversation_type: Option<ConversationType>,
         #[cfg(not(target_arch = "wasm32"))] mut convo_callback: impl FnMut(Result<MlsGroup<Context>>)
-            + Send
-            + 'static,
+        + Send
+        + 'static,
         #[cfg(target_arch = "wasm32")] mut convo_callback: impl FnMut(Result<MlsGroup<Context>>)
-            + 'static,
+        + 'static,
         #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
         #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
+        include_duplicate_dms: bool,
     ) -> impl StreamHandle<StreamOutput = Result<()>> {
         let (tx, rx) = oneshot::channel();
 
         xmtp_common::spawn(Some(rx), async move {
-            let stream = client.stream_conversations(conversation_type).await?;
+            let stream = match client
+                .stream_conversations(conversation_type, include_duplicate_dms)
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::warn!("Failed to create conversation stream, closing: {}", e);
+                    on_close();
+                    return Ok::<_, SubscribeError>(());
+                }
+            };
             futures::pin_mut!(stream);
             let _ = tx.send(());
             while let Some(convo) = stream.next().await {
@@ -323,8 +364,8 @@ where
         conversation_type: Option<ConversationType>,
         consent_state: Option<Vec<ConsentState>>,
         #[cfg(not(target_arch = "wasm32"))] mut callback: impl FnMut(Result<StoredGroupMessage>)
-            + Send
-            + 'static,
+        + Send
+        + 'static,
         #[cfg(target_arch = "wasm32")] mut callback: impl FnMut(Result<StoredGroupMessage>) + 'static,
         #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
         #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
@@ -333,7 +374,15 @@ where
 
         xmtp_common::spawn(Some(rx), async move {
             tracing::debug!("stream all messages with callback");
-            let stream = StreamAllMessages::new(&context, conversation_type, consent_state).await?;
+            let stream =
+                match StreamAllMessages::new(&context, conversation_type, consent_state).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::warn!("Failed to create message stream, closing: {}", e);
+                        on_close();
+                        return Ok::<_, SubscribeError>(());
+                    }
+                };
 
             futures::pin_mut!(stream);
             let _ = tx.send(());
@@ -350,10 +399,10 @@ where
     pub fn stream_consent_with_callback(
         client: Arc<Client<Context>>,
         #[cfg(not(target_arch = "wasm32"))] mut callback: impl FnMut(Result<Vec<StoredConsentRecord>>)
-            + Send
-            + 'static,
+        + Send
+        + 'static,
         #[cfg(target_arch = "wasm32")] mut callback: impl FnMut(Result<Vec<StoredConsentRecord>>)
-            + 'static,
+        + 'static,
         #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
         #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
     ) -> impl StreamHandle<StreamOutput = Result<()>> {
@@ -377,8 +426,8 @@ where
     pub fn stream_preferences_with_callback(
         client: Arc<Client<Context>>,
         #[cfg(not(target_arch = "wasm32"))] mut callback: impl FnMut(Result<Vec<PreferenceUpdate>>)
-            + Send
-            + 'static,
+        + Send
+        + 'static,
         #[cfg(target_arch = "wasm32")] mut callback: impl FnMut(Result<Vec<PreferenceUpdate>>) + 'static,
         #[cfg(target_arch = "wasm32")] on_close: impl FnOnce() + 'static,
         #[cfg(not(target_arch = "wasm32"))] on_close: impl FnOnce() + Send + 'static,
@@ -394,7 +443,7 @@ where
             while let Some(message) = stream.next().await {
                 callback(message)
             }
-            tracing::debug!("`stream_consent` stream ended, dropping stream");
+            tracing::debug!("`stream_preferences` stream ended, dropping stream");
             on_close();
             Ok::<_, SubscribeError>(())
         })
@@ -439,13 +488,15 @@ pub(crate) mod tests {
     #[macro_export]
     macro_rules! assert_msg_exists {
         ($stream:expr) => {
-            assert!(!$stream
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .decrypted_message_bytes
-                .is_empty());
+            assert!(
+                !$stream
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .decrypted_message_bytes
+                    .is_empty()
+            );
         };
     }
 }

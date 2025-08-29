@@ -1,15 +1,15 @@
 pub mod commit_log;
+pub mod commit_log_key;
 pub mod device_sync;
 pub mod device_sync_legacy;
+pub mod disappearing_messages;
 mod error;
 pub mod group_membership;
 pub mod group_permissions;
 pub mod intents;
-pub mod members;
-pub mod welcome_sync;
-
-pub mod disappearing_messages;
 pub mod key_package_cleaner_worker;
+pub mod members;
+pub mod message_list;
 pub(super) mod mls_ext;
 pub(super) mod mls_sync;
 pub(super) mod subscriptions;
@@ -17,35 +17,27 @@ pub mod summary;
 #[cfg(test)]
 mod tests;
 pub mod validated_commit;
+pub mod welcome_sync;
+mod welcomes;
+pub use welcomes::*;
 
 pub use self::group_permissions::PreconfiguredPolicies;
 use self::{
     group_membership::GroupMembership,
     group_permissions::PolicySet,
-    group_permissions::{extract_group_permissions, GroupMutablePermissions},
+    group_permissions::{GroupMutablePermissions, extract_group_permissions},
     intents::{
         AdminListActionType, PermissionPolicyOption, PermissionUpdateType,
         UpdateAdminListIntentData, UpdateMetadataIntentData, UpdatePermissionIntentData,
     },
-    validated_commit::extract_group_membership,
 };
-use crate::groups::mls_ext::CommitLogStorer;
-use crate::{
-    client::ClientError,
-    configuration::{
-        CIPHERSUITE, MAX_GROUP_SIZE, MAX_PAST_EPOCHS, SEND_MESSAGE_UPDATE_INSTALLATIONS_INTERVAL_NS,
-    },
-    identity_updates::load_identity_updates,
-    intents::ProcessIntentError,
-    subscriptions::LocalEvents,
-    utils::id::calculate_message_id,
-};
-use crate::{context::XmtpSharedContext, GroupCommitLock};
+use crate::groups::{intents::QueueIntent, mls_ext::CommitLogStorer};
+use crate::{GroupCommitLock, context::XmtpSharedContext};
+use crate::{client::ClientError, subscriptions::LocalEvents, utils::id::calculate_message_id};
 use crate::{subscriptions::SyncWorkerEvent, track};
 use device_sync::preference_sync::PreferenceUpdate;
 pub use error::*;
 use intents::{SendMessageIntentData, UpdateGroupMembershipResult};
-use mls_ext::DecryptedWelcome;
 use mls_sync::GroupMessageProcessingError;
 use openmls::{
     credentials::CredentialType,
@@ -55,7 +47,7 @@ use openmls::{
     },
     group::MlsGroupCreateConfig,
     messages::proposals::ProposalType,
-    prelude::{Capabilities, GroupId, MlsGroup as OpenMlsGroup, StagedWelcome, WireFormatPolicy},
+    prelude::{Capabilities, GroupId, MlsGroup as OpenMlsGroup, WireFormatPolicy},
 };
 use openmls_traits::storage::CURRENT_VERSION;
 use prost::Message;
@@ -63,53 +55,52 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::Mutex;
-use validated_commit::LibXMTPVersion;
 use xmtp_common::time::now_ns;
-use xmtp_content_types::should_push;
-use xmtp_content_types::ContentCodec;
-use xmtp_content_types::{
-    group_updated::GroupUpdatedCodec,
-    reaction::{LegacyReaction, ReactionCodec},
+use xmtp_configuration::{
+    CIPHERSUITE, GROUP_MEMBERSHIP_EXTENSION_ID, GROUP_PERMISSIONS_EXTENSION_ID, MAX_GROUP_SIZE,
+    MAX_PAST_EPOCHS, MUTABLE_METADATA_EXTENSION_ID, SEND_MESSAGE_UPDATE_INSTALLATIONS_INTERVAL_NS,
 };
-use xmtp_db::local_commit_log::LocalCommitLog;
+use xmtp_content_types::ContentCodec;
+use xmtp_content_types::should_push;
+use xmtp_content_types::{
+    reaction::{LegacyReaction, ReactionCodec},
+    reply::ReplyCodec,
+};
+use xmtp_cryptography::configuration::ED25519_KEY_LENGTH;
+use xmtp_db::prelude::*;
 use xmtp_db::user_preferences::HmacKey;
-use xmtp_db::xmtp_openmls_provider::{XmtpOpenMlsProvider, XmtpOpenMlsProviderRef};
-use xmtp_db::XmtpMlsStorageProvider;
-use xmtp_db::{consent_record::ConsentType, Fetch};
+use xmtp_db::{Fetch, consent_record::ConsentType};
+use xmtp_db::{
+    NotFound, StorageError,
+    group_message::{ContentType, StoredGroupMessageWithReactions},
+    refresh_state::EntityKind,
+};
+use xmtp_db::{Store, StoreOrIgnore};
+use xmtp_db::{
+    XmtpMlsStorageProvider,
+    remote_commit_log::{RemoteCommitLog, RemoteCommitLogOrder},
+};
 use xmtp_db::{
     consent_record::{ConsentState, StoredConsentRecord},
     group::{ConversationType, GroupMembershipState, StoredGroup},
-    group_intent::IntentKind,
     group_message::{DeliveryStatus, GroupMessageKind, MsgQueryArgs, StoredGroupMessage},
 };
-use xmtp_db::{
-    group_message::{ContentType, StoredGroupMessageWithReactions},
-    refresh_state::EntityKind,
-    NotFound, StorageError,
-};
-use xmtp_db::{prelude::*, ConnectionExt};
-use xmtp_db::{Store, StoreOrIgnore};
+use xmtp_db::{group_message::LatestMessageTimeBySender, local_commit_log::LocalCommitLog};
 use xmtp_id::associations::Identifier;
 use xmtp_id::{AsIdRef, InboxId, InboxIdRef};
 use xmtp_mls_common::{
-    config::{
-        GROUP_MEMBERSHIP_EXTENSION_ID, GROUP_PERMISSIONS_EXTENSION_ID,
-        MUTABLE_METADATA_EXTENSION_ID,
-    },
     group::{DMMetadataOptions, GroupMetadataOptions},
-    group_metadata::{extract_group_metadata, DmMembers, GroupMetadata, GroupMetadataError},
+    group_metadata::{DmMembers, GroupMetadata, GroupMetadataError, extract_group_metadata},
     group_mutable_metadata::{
-        extract_group_mutable_metadata, GroupMutableMetadata, GroupMutableMetadataError,
-        MessageDisappearingSettings, MetadataField,
+        GroupMutableMetadata, GroupMutableMetadataError, MessageDisappearingSettings, MetadataField,
     },
 };
 use xmtp_proto::xmtp::mls::{
     api::v1::welcome_message,
     message_contents::{
+        EncodedContent, PlaintextEnvelope,
         content_types::ReactionV2,
-        group_updated::Inbox,
         plaintext_envelope::{Content, V1},
-        ContentTypeId, EncodedContent, GroupUpdated, PlaintextEnvelope,
     },
 };
 
@@ -117,6 +108,10 @@ const MAX_GROUP_DESCRIPTION_LENGTH: usize = 1000;
 const MAX_GROUP_NAME_LENGTH: usize = 100;
 const MAX_GROUP_IMAGE_URL_LENGTH: usize = 2048;
 
+/// An LibXMTP MlsGroup
+/// _NOTE:_ The Eq implementation compares GroupId, so a dm group with the same identity will be
+/// different.
+/// the Hash implementation hashes the GroupID
 pub struct MlsGroup<Context> {
     pub group_id: Vec<u8>,
     pub dm_id: Option<String>,
@@ -126,6 +121,20 @@ pub struct MlsGroup<Context> {
     mls_commit_lock: Arc<GroupCommitLock>,
     mutex: Arc<Mutex<()>>,
 }
+
+impl<C> std::hash::Hash for MlsGroup<C> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.group_id.hash(state);
+    }
+}
+
+impl<C> PartialEq for MlsGroup<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.group_id == other.group_id
+    }
+}
+
+impl<C> Eq for MlsGroup<C> {}
 
 impl<Context> std::fmt::Debug for MlsGroup<Context>
 where
@@ -150,6 +159,7 @@ where
 pub struct ConversationListItem<Context> {
     pub group: MlsGroup<Context>,
     pub last_message: Option<StoredGroupMessage>,
+    pub is_commit_log_forked: Option<bool>,
 }
 
 impl<Context: XmtpSharedContext> Clone for MlsGroup<Context> {
@@ -171,7 +181,9 @@ pub struct ConversationDebugInfo {
     pub epoch: u64,
     pub maybe_forked: bool,
     pub fork_details: String,
+    pub is_commit_log_forked: Option<bool>,
     pub local_commit_log: String,
+    pub remote_commit_log: String,
     pub cursor: i64,
 }
 
@@ -210,11 +222,14 @@ impl TryFrom<EncodedContent> for QueryableContentFields {
     type Error = prost::DecodeError;
 
     fn try_from(content: EncodedContent) -> Result<Self, Self::Error> {
-        let content_type_id = content.r#type.unwrap_or_default();
+        let content_type_id = content.r#type.clone().unwrap_or_default();
 
         let type_id_str = content_type_id.type_id.clone();
 
         let reference_id = match (type_id_str.as_str(), content_type_id.version_major) {
+            (ReplyCodec::TYPE_ID, 1) => ReplyCodec::decode(content)
+                .ok()
+                .and_then(|reply| hex::decode(reply.reference).ok()),
             (ReactionCodec::TYPE_ID, major) if major >= 2 => {
                 ReactionV2::decode(content.content.as_slice())
                     .ok()
@@ -233,6 +248,20 @@ impl TryFrom<EncodedContent> for QueryableContentFields {
             reference_id,
             should_push: should_push(type_id_str),
         })
+    }
+}
+
+impl<Context: Clone> From<MlsGroup<&Context>> for MlsGroup<Context> {
+    fn from(group: MlsGroup<&Context>) -> MlsGroup<Context> {
+        MlsGroup::<Context> {
+            context: group.context.clone(),
+            group_id: group.group_id,
+            dm_id: group.dm_id,
+            created_at_ns: group.created_at_ns,
+            mls_commit_lock: group.mls_commit_lock,
+            mutex: group.mutex,
+            conversation_type: group.conversation_type,
+        }
     }
 }
 
@@ -278,7 +307,7 @@ where
                     context,
                     group_id.to_vec(),
                     group.dm_id.clone(),
-                    ConversationType::Group,
+                    group.conversation_type,
                     group.created_at_ns,
                 ),
                 group,
@@ -392,6 +421,7 @@ where
 
         // Consent state defaults to allowed when the user creates the group
         new_group.update_consent_state(ConsentState::Allowed)?;
+
         Ok(new_group)
     }
 
@@ -538,291 +568,15 @@ where
         context: Context,
         welcome: &welcome_message::V1,
         cursor_increment: bool,
+        validator: impl ValidateGroupMembership,
     ) -> Result<Self, GroupError> {
-        let conn = &context.db();
-        // Check if this welcome was already processed. Return the existing group if so.
-        if conn.get_last_cursor_for_id(context.installation_id(), EntityKind::Welcome)?
-            >= welcome.id as i64
-        {
-            let group = conn
-                .find_group_by_welcome_id(welcome.id as i64)?
-                // The welcome previously errored out, e.g. HPKE error, so it's not in the DB
-                .ok_or(GroupError::NotFound(NotFound::GroupByWelcome(
-                    welcome.id as i64,
-                )))?;
-            let group = Self::new(
-                context,
-                group.id,
-                group.dm_id,
-                group.conversation_type,
-                group.created_at_ns,
-            );
-
-            tracing::warn!("Skipping old welcome {}", welcome.id);
-            return Ok(group);
-        };
-
-        let mut decrypt_result: Result<DecryptedWelcome, GroupError> =
-            Err(GroupError::UninitializedResult);
-        let transaction_result = context.mls_storage().transaction(|conn| {
-            let mls_storage = conn.key_store();
-            decrypt_result = DecryptedWelcome::from_encrypted_bytes(
-                &XmtpOpenMlsProvider::new(mls_storage),
-                &welcome.hpke_public_key,
-                &welcome.data,
-                welcome.wrapper_algorithm.into(),
-            );
-            Err(StorageError::IntentionalRollback)
-        });
-
-        // TODO: Move cursor forward on non-retriable errors, but not on retriable errors
-        let Err(StorageError::IntentionalRollback) = transaction_result else {
-            return Err(transaction_result?);
-        };
-
-        let DecryptedWelcome { staged_welcome, .. } = decrypt_result?;
-        // Ensure that the list of members in the group's MLS tree matches the list of inboxes specified
-        // in the `GroupMembership` extension.
-        validate_initial_group_membership(&context, &staged_welcome).await?;
-        let group_id = staged_welcome.public_group().group_id();
-        if conn.find_group(group_id.as_slice())?.is_some() {
-            // Fetch the original MLS group, rather than the one from the welcome
-            let result = MlsGroup::new_cached(context.clone(), group_id.as_slice());
-            if result.is_err() {
-                tracing::error!(
-                    "Error fetching group while validating welcome: {:?}",
-                    result.err()
-                );
-            } else {
-                let (group, _) = result.expect("No error");
-                // Check the group epoch as well, because we may not have synced the latest is_active state
-                // TODO(rich): Design a better way to detect if incoming welcomes are valid
-                if group.is_active()?
-                    && staged_welcome
-                        .public_group()
-                        .group_context()
-                        .epoch()
-                        .as_u64()
-                        <= group.epoch().await?
-                {
-                    tracing::error!(
-                        "Skipping welcome {} because we are already in group {}",
-                        welcome.id,
-                        hex::encode(group_id.as_slice())
-                    );
-                    return Err(ProcessIntentError::WelcomeAlreadyProcessed(welcome.id).into());
-                }
-            }
-        }
-
-        context.mls_storage().transaction(|conn| {
-            let storage = conn.key_store();
-            let db = storage.db();
-            let provider = XmtpOpenMlsProviderRef::new(&storage);
-            let decrypted_welcome = DecryptedWelcome::from_encrypted_bytes(
-                &provider,
-                &welcome.hpke_public_key,
-                &welcome.data,
-                welcome.wrapper_algorithm.into(),
-            )?;
-            let DecryptedWelcome {
-                staged_welcome,
-                added_by_inbox_id,
-                added_by_installation_id,
-            } = decrypted_welcome;
-
-            tracing::debug!(
-                "calling update cursor for welcome {}",
-                welcome.id
-            );
-            let requires_processing = {
-                let current_cursor = db.get_last_cursor_for_id(context.installation_id(), EntityKind::Welcome)?;
-                welcome.id > current_cursor as u64
-            };
-            if !requires_processing {
-                tracing::error!("Skipping already processed welcome {}", welcome.id);
-                return Err(ProcessIntentError::WelcomeAlreadyProcessed(welcome.id).into());
-            }
-            if cursor_increment {
-                // TODO: We update the cursor if this welcome decrypts successfully, but if previous welcomes
-                // failed due to retriable errors, this will permanently skip them.
-                db.update_cursor(
-                    context.installation_id(),
-                    EntityKind::Welcome,
-                    welcome.id as i64,
-                )?;
-            }
-
-
-            let mls_group = OpenMlsGroup::from_welcome_logged(&provider, staged_welcome, &added_by_inbox_id, &added_by_installation_id)?;
-            let group_id = mls_group.group_id().to_vec();
-            let metadata = extract_group_metadata(&mls_group).map_err(MetadataPermissionsError::from)?;
-            let dm_members = metadata.dm_members;
-            let conversation_type = metadata.conversation_type;
-            let mutable_metadata = extract_group_mutable_metadata(&mls_group).ok();
-            let disappearing_settings = mutable_metadata.as_ref().and_then(|metadata| {
-                Self::conversation_message_disappearing_settings_from_extensions(metadata).ok()
-            });
-
-            let paused_for_version: Option<String> = mutable_metadata.as_ref().and_then(|metadata| {
-                let min_version = Self::min_protocol_version_from_extensions(metadata);
-                if let Some(min_version) = min_version {
-                    let current_version_str = context.version_info().pkg_version();
-                    let current_version =
-                        LibXMTPVersion::parse(current_version_str).ok()?;
-                    let required_min_version = LibXMTPVersion::parse(&min_version.clone()).ok()?;
-                    if required_min_version > current_version {
-                        tracing::warn!(
-                            "Saving group from welcome as paused since version requirements are not met. \
-                            Group ID: {}, \
-                            Required version: {}, \
-                            Current version: {}",
-                            hex::encode(group_id.clone()),
-                            min_version,
-                            current_version_str
-                        );
-                        Some(min_version)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            });
-
-            let mut group = StoredGroup::builder();
-            group.id(group_id)
-                .created_at_ns(now_ns())
-                .added_by_inbox_id(&added_by_inbox_id)
-                .welcome_id(welcome.id as i64)
-                .conversation_type(conversation_type)
-                .dm_id(dm_members.map(String::from))
-                .message_disappear_from_ns(disappearing_settings.as_ref().map(|m| m.from_ns))
-                .message_disappear_in_ns(disappearing_settings.as_ref().map(|m| m.in_ns))
-                .should_publish_commit_log(Self::check_should_publish_commit_log(context.inbox_id().to_string(), mutable_metadata));
-
-
-
-            let to_store = match conversation_type {
-                ConversationType::Group => {
-                    group
-                        .membership_state(GroupMembershipState::Pending)
-                        .paused_for_version(paused_for_version)
-                        .build()?
-                },
-                ConversationType::Dm => {
-                    validate_dm_group(&context, &mls_group, &added_by_inbox_id)?;
-                    group
-                        .membership_state(GroupMembershipState::Pending)
-                        .last_message_ns(welcome.created_ns as i64)
-                        .build()?
-                }
-                ConversationType::Sync => {
-                    // Let the DeviceSync worker know about the presence of a new
-                    // sync group that came in from a welcome.3
-                    let group_id = mls_group.group_id().to_vec();
-                    let _ = context.worker_events().send(SyncWorkerEvent::NewSyncGroupFromWelcome(group_id));
-
-                    group
-                        .membership_state(GroupMembershipState::Allowed)
-                        .build()?
-                },
-            };
-
-            tracing::warn!("storing group with welcome id {}", welcome.id);
-            // Insert or replace the group in the database.
-            // Replacement can happen in the case that the user has been removed from and subsequently re-added to the group.
-            let stored_group = db.insert_or_replace_group(to_store)?;
-
-            StoredConsentRecord::stitch_dm_consent(&db, &stored_group)?;
-            track!(
-                "Group Welcome",
-                {
-                    "conversation_type": stored_group.conversation_type,
-                    "added_by_inbox_id": &stored_group.added_by_inbox_id
-                },
-                group: &stored_group.id
-            );
-
-            // Create a GroupUpdated payload
-                let current_inbox_id = context.inbox_id().to_string();
-                let added_payload = GroupUpdated {
-                    initiated_by_inbox_id: added_by_inbox_id.clone(),
-                    added_inboxes: vec![Inbox {
-                        inbox_id: current_inbox_id.clone(),
-                    }],
-                    removed_inboxes: vec![],
-                    metadata_field_changes: vec![],
-                };
-
-                let encoded_added_payload = GroupUpdatedCodec::encode(added_payload)?;
-                let mut encoded_added_payload_bytes = Vec::new();
-                encoded_added_payload
-                    .encode(&mut encoded_added_payload_bytes)
-                    .map_err(GroupError::EncodeError)?;
-
-                let added_message_id = crate::utils::id::calculate_message_id(
-                    &stored_group.id,
-                    encoded_added_payload_bytes.as_slice(),
-                    &format!("{}_welcome_added", welcome.created_ns),
-                );
-
-                let added_content_type = match encoded_added_payload.r#type {
-                    Some(ct) => ct,
-                    None => {
-                        tracing::warn!(
-                            "Missing content type in encoded added payload, using default values"
-                        );
-                        ContentTypeId {
-                            authority_id: "unknown".to_string(),
-                            type_id: "unknown".to_string(),
-                            version_major: 0,
-                            version_minor: 0,
-                        }
-                    }
-                };
-
-                let added_msg = StoredGroupMessage {
-                    id: added_message_id,
-                    group_id: stored_group.id.clone(),
-                    decrypted_message_bytes: encoded_added_payload_bytes,
-                    sent_at_ns: welcome.created_ns as i64,
-                    kind: GroupMessageKind::MembershipChange,
-                    sender_installation_id: welcome.installation_key.clone(),
-                    sender_inbox_id: added_by_inbox_id,
-                    delivery_status: DeliveryStatus::Published,
-                    content_type: added_content_type.type_id.into(),
-                    version_major: added_content_type.version_major as i32,
-                    version_minor: added_content_type.version_minor as i32,
-                    authority_id: added_content_type.authority_id,
-                    reference_id: None,
-                    sequence_id: Some(welcome.id as i64),
-                    originator_id: None,
-                    expire_at_ns: None,
-                };
-
-                added_msg.store_or_ignore(&db)?;
-
-                tracing::info!(
-                    "[{}]: Created GroupUpdated message for welcome",
-                    current_inbox_id
-                );
-
-            let group = Self::new(
-                context.clone(),
-                stored_group.id,
-                stored_group.dm_id,
-                stored_group.conversation_type,
-                stored_group.created_at_ns,
-            );
-
-            // If this group is created by us - auto-consent to it.
-            if context.inbox_id() == metadata.creator_inbox_id {
-                group.quietly_update_consent_state(ConsentState::Allowed, &db)?;
-            }
-
-            Ok(group)
-        })
+        XmtpWelcome::builder()
+            .context(context)
+            .welcome(welcome)
+            .cursor_increment(cursor_increment)
+            .validator(validator)
+            .process()
+            .await
     }
 
     // Super admin status is only criteria for whether to publish the commit log for now
@@ -880,7 +634,11 @@ where
     }
 
     /// Send a message on this users XMTP [`Client`].
-    #[tracing::instrument(skip_all, level = "trace")]
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", skip(self), fields(who = self.context.inbox_id(), message = %String::from_utf8_lossy(message))))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn send_message(&self, message: &[u8]) -> Result<Vec<u8>, GroupError> {
         if !self.is_active()? {
             tracing::warn!("Unable to send a message on an inactive group.");
@@ -903,6 +661,11 @@ where
 
     /// Publish all unpublished messages. This happens by calling `sync_until_last_intent_resolved`
     /// which publishes all pending intents and reads them back from the network.
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn publish_messages(&self) -> Result<(), GroupError> {
         self.ensure_not_paused().await?;
         let update_interval_ns = Some(SEND_MESSAGE_UPDATE_INSTALLATIONS_INTERVAL_NS);
@@ -975,11 +738,10 @@ where
         let intent_data: Vec<u8> = SendMessageIntentData::new(encoded_envelope).into();
         let queryable_content_fields: QueryableContentFields =
             Self::extract_queryable_content_fields(message);
-        self.queue_intent(
-            IntentKind::SendMessage,
-            intent_data,
-            queryable_content_fields.should_push,
-        )?;
+        QueueIntent::send_message()
+            .data(intent_data)
+            .should_push(queryable_content_fields.should_push)
+            .queue(self)?;
 
         // store this unpublished message locally before sending
         let message_id = calculate_message_id(&self.group_id, message, &now.to_string());
@@ -1037,6 +799,13 @@ where
         Ok(messages)
     }
 
+    pub fn get_last_read_times(&self) -> Result<LatestMessageTimeBySender, GroupError> {
+        let conn = self.context.db();
+        let latest_read_receipt =
+            conn.get_latest_message_times_by_sender(&self.group_id, &[ContentType::ReadReceipt])?;
+        Ok(latest_read_receipt)
+    }
+
     ///
     /// Add members to the group by account address
     ///
@@ -1087,12 +856,17 @@ where
             .await
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", skip_all, fields(who = %self.context.inbox_id(), inbox_ids = ?inbox_ids.as_ref().iter().map(|i| i.as_ref()).collect::<Vec<_>>())))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip_all)
+    )]
     pub async fn add_members_by_inbox_id<S: AsIdRef>(
         &self,
         inbox_ids: impl AsRef<[S]>,
     ) -> Result<UpdateGroupMembershipResult, GroupError> {
         self.ensure_not_paused().await?;
+
         let ids = inbox_ids
             .as_ref()
             .iter()
@@ -1112,11 +886,11 @@ where
             return ok_result;
         }
 
-        let intent =
-            self.queue_intent(IntentKind::UpdateGroupMembership, intent_data.into(), false)?;
+        let intent = QueueIntent::update_group_membership()
+            .data(intent_data)
+            .queue(self)?;
 
         self.sync_until_intent_resolved(intent.id).await?;
-
         track!(
             "Group Membership Change",
             {
@@ -1165,14 +939,20 @@ where
     ///
     /// # Returns
     /// A `Result` indicating success or failure of the operation.
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", skip_all, fields(who = %self.context.inbox_id(), inbox_ids = ?inbox_ids)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip_all)
+    )]
     pub async fn remove_members_by_inbox_id(
         &self,
         inbox_ids: &[InboxIdRef<'_>],
     ) -> Result<(), GroupError> {
         self.ensure_not_paused().await?;
         let intent_data = self.get_membership_update_intent(&[], inbox_ids).await?;
-        let intent =
-            self.queue_intent(IntentKind::UpdateGroupMembership, intent_data.into(), false)?;
+        let intent = QueueIntent::update_group_membership()
+            .data(intent_data)
+            .queue(self)?;
 
         let _ = self.sync_until_intent_resolved(intent.id).await?;
 
@@ -1190,6 +970,11 @@ where
 
     /// Updates the name of the group. Will error if the user does not have the appropriate permissions
     /// to perform these updates.
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn update_group_name(&self, group_name: String) -> Result<(), GroupError> {
         self.ensure_not_paused().await?;
 
@@ -1203,13 +988,20 @@ where
         }
         let intent_data: Vec<u8> =
             UpdateMetadataIntentData::new_update_group_name(group_name).into();
-        let intent = self.queue_intent(IntentKind::MetadataUpdate, intent_data, false)?;
+        let intent = QueueIntent::metadata_update()
+            .data(intent_data)
+            .queue(self)?;
 
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
     }
 
     /// Updates min version of the group to match this client's version.
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn update_group_min_version_to_match_self(&self) -> Result<(), GroupError> {
         self.ensure_not_paused().await?;
         let version = self.context.version_info().pkg_version();
@@ -1218,7 +1010,30 @@ where
                 version.to_string(),
             )
             .into();
-        let intent = self.queue_intent(IntentKind::MetadataUpdate, intent_data, false)?;
+        let intent = QueueIntent::metadata_update()
+            .data(intent_data)
+            .queue(self)?;
+
+        let _ = self.sync_until_intent_resolved(intent.id).await?;
+        Ok(())
+    }
+
+    /// Updates the commit log signer of the group. Will error if the user does not have the appropriate permissions
+    /// to perform these updates.
+    pub async fn update_commit_log_signer(
+        &self,
+        commit_log_signer: xmtp_cryptography::Secret,
+    ) -> Result<(), GroupError> {
+        self.ensure_not_paused().await?;
+
+        if self.metadata().await?.conversation_type == ConversationType::Dm {
+            return Err(MetadataPermissionsError::DmGroupMetadataForbidden.into());
+        }
+        let intent_data: Vec<u8> =
+            UpdateMetadataIntentData::new_update_commit_log_signer(commit_log_signer).into();
+        let intent = QueueIntent::metadata_update()
+            .data(intent_data)
+            .queue(self)?;
 
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
@@ -1234,6 +1049,11 @@ where
     }
 
     /// Updates the permission policy of the group. This requires super admin permissions.
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn update_permission_policy(
         &self,
         permission_update_type: PermissionUpdateType,
@@ -1258,7 +1078,9 @@ where
         )
         .into();
 
-        let intent = self.queue_intent(IntentKind::UpdatePermission, intent_data, false)?;
+        let intent = QueueIntent::update_permission()
+            .data(intent_data)
+            .queue(self)?;
 
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
@@ -1280,6 +1102,11 @@ where
     }
 
     /// Updates the description of the group.
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn update_group_description(
         &self,
         group_description: String,
@@ -1297,7 +1124,9 @@ where
         }
         let intent_data: Vec<u8> =
             UpdateMetadataIntentData::new_update_group_description(group_description).into();
-        let intent = self.queue_intent(IntentKind::MetadataUpdate, intent_data, false)?;
+        let intent = QueueIntent::metadata_update()
+            .data(intent_data)
+            .queue(self)?;
 
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
@@ -1317,6 +1146,11 @@ where
     }
 
     /// Updates the image URL (square) of the group.
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn update_group_image_url_square(
         &self,
         group_image_url_square: String,
@@ -1335,7 +1169,9 @@ where
         let intent_data: Vec<u8> =
             UpdateMetadataIntentData::new_update_group_image_url_square(group_image_url_square)
                 .into();
-        let intent = self.queue_intent(IntentKind::MetadataUpdate, intent_data, false)?;
+        let intent = QueueIntent::metadata_update()
+            .data(intent_data)
+            .queue(self)?;
 
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
@@ -1379,6 +1215,11 @@ where
         .await
     }
 
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     async fn update_conversation_message_disappear_from_ns(
         &self,
         expire_from_ms: i64,
@@ -1390,11 +1231,18 @@ where
                 expire_from_ms,
             )
             .into();
-        let intent = self.queue_intent(IntentKind::MetadataUpdate, intent_data, false)?;
+        let intent = QueueIntent::metadata_update()
+            .data(intent_data)
+            .queue(self)?;
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
     }
 
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     async fn update_conversation_message_disappear_in_ns(
         &self,
         expire_in_ms: i64,
@@ -1404,7 +1252,9 @@ where
         let intent_data: Vec<u8> =
             UpdateMetadataIntentData::new_update_conversation_message_disappear_in_ns(expire_in_ms)
                 .into();
-        let intent = self.queue_intent(IntentKind::MetadataUpdate, intent_data, false)?;
+        let intent = QueueIntent::metadata_update()
+            .data(intent_data)
+            .queue(self)?;
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
     }
@@ -1487,6 +1337,11 @@ where
     }
 
     /// Updates the admin list of the group and syncs the changes to the network.
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn update_admin_list(
         &self,
         action_type: UpdateAdminListType,
@@ -1503,7 +1358,9 @@ where
         };
         let intent_data: Vec<u8> =
             UpdateAdminListIntentData::new(intent_action_type, inbox_id).into();
-        let intent = self.queue_intent(IntentKind::UpdateAdminList, intent_data, false)?;
+        let intent = QueueIntent::update_admin_list()
+            .data(intent_data)
+            .queue(self)?;
 
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
@@ -1533,10 +1390,10 @@ where
     }
 
     // Returns new consent records. Does not broadcast changes.
-    pub fn quietly_update_consent_state<C: ConnectionExt>(
+    pub fn quietly_update_consent_state(
         &self,
         state: ConsentState,
-        db: &impl DbQuery<C>,
+        db: &impl DbQuery,
     ) -> Result<Vec<StoredConsentRecord>, GroupError> {
         let consent_record = StoredConsentRecord::new(
             ConsentType::ConversationId,
@@ -1544,7 +1401,7 @@ where
             hex::encode(self.group_id.clone()),
         );
 
-        Ok(db.insert_or_replace_consent_records(&[consent_record.clone()])?)
+        Ok(db.insert_or_replace_consent_records(std::slice::from_ref(&consent_record))?)
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
@@ -1589,10 +1446,19 @@ where
         Ok(self.context.db().get_group_logs(&self.group_id)?)
     }
 
+    pub async fn remote_commit_log(&self) -> Result<Vec<RemoteCommitLog>, GroupError> {
+        Ok(self.context.db().get_remote_commit_log_after_cursor(
+            &self.group_id,
+            0,
+            RemoteCommitLogOrder::AscendingByRowid,
+        )?)
+    }
+
     pub async fn debug_info(&self) -> Result<ConversationDebugInfo, GroupError> {
         let epoch = self.epoch().await?;
         let cursor = self.cursor().await?;
         let commit_log = self.local_commit_log().await?;
+        let remote_commit_log = self.remote_commit_log().await?;
         let db = self.context.db();
 
         let stored_group = match db.find_group(&self.group_id)? {
@@ -1600,7 +1466,7 @@ where
             None => {
                 return Err(GroupError::NotFound(NotFound::GroupById(
                     self.group_id.clone(),
-                )))
+                )));
             }
         };
 
@@ -1608,14 +1474,21 @@ where
             epoch,
             maybe_forked: stored_group.maybe_forked,
             fork_details: stored_group.fork_details,
+            is_commit_log_forked: stored_group.is_commit_log_forked,
             local_commit_log: format!("{:?}", commit_log),
+            remote_commit_log: format!("{:?}", remote_commit_log),
             cursor,
         })
     }
 
     /// Update this installation's leaf key in the group by creating a key update commit
+    #[cfg_attr(any(test, feature = "test-utils"), tracing::instrument(level = "info", fields(who = %self.context.inbox_id()), skip(self)))]
+    #[cfg_attr(
+        not(any(test, feature = "test-utils")),
+        tracing::instrument(level = "trace", skip(self))
+    )]
     pub async fn key_update(&self) -> Result<(), GroupError> {
-        let intent = self.queue_intent(IntentKind::KeyUpdate, vec![], false)?;
+        let intent = QueueIntent::key_update().queue(self)?;
         let _ = self.sync_until_intent_resolved(intent.id).await?;
         Ok(())
     }
@@ -1776,7 +1649,7 @@ where
     }
 }
 
-fn build_protected_metadata_extension(
+pub(crate) fn build_protected_metadata_extension(
     creator_inbox_id: &str,
     conversation_type: ConversationType,
 ) -> Result<Extension, MetadataPermissionsError> {
@@ -1809,7 +1682,7 @@ fn build_dm_protected_metadata_extension(
     Ok(Extension::ImmutableMetadata(protected_metadata))
 }
 
-fn build_mutable_permissions_extension(
+pub(crate) fn build_mutable_permissions_extension(
     policies: PolicySet,
 ) -> Result<Extension, MetadataPermissionsError> {
     let permissions: Vec<u8> = GroupMutablePermissions::new(policies).try_into()?;
@@ -1825,8 +1698,13 @@ pub fn build_mutable_metadata_extension_default(
     creator_inbox_id: &str,
     opts: GroupMetadataOptions,
 ) -> Result<Extension, GroupError> {
+    let mut commit_log_signer = None;
+    if xmtp_configuration::ENABLE_COMMIT_LOG {
+        // Optional TODO(rich): Plumb in provider and use traits in commit_log_key.rs to generate and store secret
+        commit_log_signer = Some(xmtp_cryptography::rand::rand_secret::<ED25519_KEY_LENGTH>());
+    }
     let mutable_metadata: Vec<u8> =
-        GroupMutableMetadata::new_default(creator_inbox_id.to_string(), opts)
+        GroupMutableMetadata::new_default(creator_inbox_id.to_string(), commit_log_signer, opts)
             .try_into()
             .map_err(MetadataPermissionsError::from)?;
     let unknown_gc_extension = UnknownExtension(mutable_metadata);
@@ -1842,9 +1720,15 @@ pub fn build_dm_mutable_metadata_extension_default(
     dm_target_inbox_id: &str,
     opts: DMMetadataOptions,
 ) -> Result<Extension, MetadataPermissionsError> {
+    let mut commit_log_signer = None;
+    if xmtp_configuration::ENABLE_COMMIT_LOG {
+        // Optional TODO(rich): Plumb in provider and use traits in commit_log_key.rs to generate and store secret
+        commit_log_signer = Some(xmtp_cryptography::rand::rand_secret::<ED25519_KEY_LENGTH>());
+    }
     let mutable_metadata: Vec<u8> = GroupMutableMetadata::new_dm_default(
         creator_inbox_id.to_string(),
         dm_target_inbox_id,
+        commit_log_signer,
         opts,
     )
     .try_into()?;
@@ -1990,7 +1874,7 @@ pub fn build_group_membership_extension(group_membership: &GroupMembership) -> E
     Extension::Unknown(GROUP_MEMBERSHIP_EXTENSION_ID, unknown_gc_extension)
 }
 
-fn build_group_config(
+pub(crate) fn build_group_config(
     protected_metadata_extension: Extension,
     mutable_metadata_extension: Extension,
     group_membership_extension: Extension,
@@ -2041,60 +1925,8 @@ fn build_group_config(
         .build())
 }
 
-/**
- * Ensures that the membership in the MLS tree matches the inboxes specified in the `GroupMembership` extension.
- */
-async fn validate_initial_group_membership(
-    context: impl XmtpSharedContext,
-    staged_welcome: &StagedWelcome,
-) -> Result<(), GroupError> {
-    let db = context.db();
-    tracing::info!("Validating initial group membership");
-    let extensions = staged_welcome.public_group().group_context().extensions();
-    let membership = extract_group_membership(extensions)?;
-    let needs_update = filter_inbox_ids_needing_updates(&db, membership.to_filters().as_slice())?;
-    if !needs_update.is_empty() {
-        let ids = needs_update.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        load_identity_updates(context.api(), &db, ids.as_slice()).await?;
-    }
-
-    let mut expected_installation_ids = HashSet::<Vec<u8>>::new();
-
-    let identity_updates = crate::identity_updates::IdentityUpdates::new(&context);
-    let futures: Vec<_> = membership
-        .members
-        .iter()
-        .map(|(inbox_id, sequence_id)| {
-            identity_updates.get_association_state(&db, inbox_id, Some(*sequence_id as i64))
-        })
-        .collect();
-
-    let results = futures::future::try_join_all(futures).await?;
-
-    for association_state in results {
-        expected_installation_ids.extend(association_state.installation_ids());
-    }
-
-    let actual_installation_ids: HashSet<Vec<u8>> = staged_welcome
-        .public_group()
-        .members()
-        .map(|member| member.signature_key)
-        .collect();
-
-    // exclude failed installations
-    expected_installation_ids.retain(|id| !membership.failed_installations.contains(id));
-
-    if expected_installation_ids != actual_installation_ids {
-        return Err(GroupError::InvalidGroupMembership);
-    }
-
-    tracing::info!("Group membership validated");
-
-    Ok(())
-}
-
-pub fn filter_inbox_ids_needing_updates<'a, C: ConnectionExt>(
-    conn: &impl DbQuery<C>,
+pub fn filter_inbox_ids_needing_updates<'a>(
+    conn: &impl DbQuery,
     filters: &[(&'a str, i64)],
 ) -> Result<Vec<&'a str>, xmtp_db::ConnectionError> {
     let existing_sequence_ids =
@@ -2104,10 +1936,10 @@ pub fn filter_inbox_ids_needing_updates<'a, C: ConnectionExt>(
         .iter()
         .filter_map(|filter| {
             let existing_sequence_id = existing_sequence_ids.get(filter.0);
-            if let Some(sequence_id) = existing_sequence_id {
-                if sequence_id.ge(&filter.1) {
-                    return None;
-                }
+            if let Some(sequence_id) = existing_sequence_id
+                && sequence_id.ge(&filter.1)
+            {
+                return None;
             }
 
             Some(filter.0)

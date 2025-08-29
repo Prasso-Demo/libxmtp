@@ -1,10 +1,11 @@
+mod test_commit_log_fork_detection;
+mod test_commit_log_local;
+mod test_commit_log_remote;
 mod test_consent;
 mod test_dm;
 mod test_key_updates;
-mod test_local_commit_log;
 #[cfg(not(target_arch = "wasm32"))]
 mod test_network;
-mod test_remote_commit_log;
 
 use prost::Message;
 use xmtp_db::refresh_state::EntityKind;
@@ -15,51 +16,54 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 use super::group_permissions::PolicySet;
 use crate::context::XmtpSharedContext;
+use crate::groups::intents::QueueIntent;
 use crate::groups::{DmValidationError, MetadataPermissionsError};
 use crate::groups::{
     MAX_GROUP_DESCRIPTION_LENGTH, MAX_GROUP_IMAGE_URL_LENGTH, MAX_GROUP_NAME_LENGTH,
 };
 use crate::tester;
-use crate::utils::{TestMlsGroup, Tester, VersionInfo};
+use crate::utils::fixtures::{alix, bola, caro};
+use crate::utils::{ClientTester, TestMlsGroup, Tester, VersionInfo};
 use crate::{
     builder::ClientBuilder,
     groups::{
-        build_dm_protected_metadata_extension, build_mutable_metadata_extension_default,
-        build_protected_metadata_extension,
+        DeliveryStatus, GroupError, GroupMetadataOptions, PreconfiguredPolicies,
+        UpdateAdminListType, build_dm_protected_metadata_extension,
+        build_mutable_metadata_extension_default, build_protected_metadata_extension,
         intents::{PermissionPolicyOption, PermissionUpdateType},
         members::{GroupMember, PermissionLevel},
         mls_sync::GroupMessageProcessingError,
-        validate_dm_group, DeliveryStatus, GroupError, GroupMetadataOptions, PreconfiguredPolicies,
-        UpdateAdminListType,
+        validate_dm_group,
     },
     utils::test::FullXmtpClient,
 };
 use diesel::connection::SimpleConnection;
 use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
 use futures::future::join_all;
+use rstest::*;
 use std::sync::Arc;
 use wasm_bindgen_test::wasm_bindgen_test;
-use xmtp_common::time::now_ns;
 use xmtp_common::RetryableError;
 use xmtp_common::StreamHandle as _;
+use xmtp_common::time::now_ns;
 use xmtp_common::{assert_err, assert_ok};
-use xmtp_content_types::{group_updated::GroupUpdatedCodec, ContentCodec};
+use xmtp_content_types::{ContentCodec, group_updated::GroupUpdatedCodec};
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_db::group::StoredGroup;
 use xmtp_db::schema::groups;
 use xmtp_db::{
+    XmtpOpenMlsProviderRef,
     consent_record::ConsentState,
     group::{ConversationType, GroupQueryArgs},
-    group_intent::{IntentKind, IntentState},
+    group_intent::IntentState,
     group_message::{GroupMessageKind, MsgQueryArgs, StoredGroupMessage},
     prelude::*,
-    XmtpOpenMlsProviderRef,
 };
-use xmtp_id::associations::test_utils::WalletTestExt;
 use xmtp_id::associations::Identifier;
+use xmtp_id::associations::test_utils::WalletTestExt;
 use xmtp_mls_common::group_metadata::GroupMetadata;
 use xmtp_mls_common::group_mutable_metadata::{MessageDisappearingSettings, MetadataField};
-use xmtp_proto::xmtp::mls::api::v1::group_message::{Version, V1 as GroupMessageV1};
+use xmtp_proto::xmtp::mls::api::v1::group_message::{V1 as GroupMessageV1, Version};
 use xmtp_proto::xmtp::mls::message_contents::EncodedContent;
 
 async fn receive_group_invite(client: &FullXmtpClient) -> TestMlsGroup {
@@ -85,9 +89,8 @@ async fn force_add_member(
     sender_mls_group: &mut openmls::prelude::MlsGroup,
     sender_provider: &impl xmtp_db::MlsProviderExt,
 ) {
-    use crate::{
-        configuration::CREATE_PQ_KEY_PACKAGE_EXTENSION, groups::mls_ext::WrapperAlgorithm,
-    };
+    use crate::groups::mls_ext::WrapperAlgorithm;
+    use xmtp_configuration::CREATE_PQ_KEY_PACKAGE_EXTENSION;
 
     use super::intents::{Installation, SendWelcomesAction};
     use openmls::prelude::tls_codec::Serialize;
@@ -1189,18 +1192,22 @@ async fn test_removed_members_cannot_send_message_to_others() {
         .await
         .unwrap();
     assert_eq!(amal_group.members().await.unwrap().len(), 2);
-    assert!(amal_group
-        .members()
-        .await
-        .unwrap()
-        .iter()
-        .all(|m| m.inbox_id != bola.inbox_id()));
-    assert!(amal_group
-        .members()
-        .await
-        .unwrap()
-        .iter()
-        .any(|m| m.inbox_id == charlie.inbox_id()));
+    assert!(
+        amal_group
+            .members()
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.inbox_id != bola.inbox_id())
+    );
+    assert!(
+        amal_group
+            .members()
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.inbox_id == charlie.inbox_id())
+    );
 
     amal_group.sync().await.expect("sync failed");
 
@@ -1334,10 +1341,12 @@ async fn test_group_permissions() {
 
     let bola_group = receive_group_invite(&bola).await;
     bola_group.sync().await.unwrap();
-    assert!(bola_group
-        .add_members_by_inbox_id(&[charlie.inbox_id()])
-        .await
-        .is_err(),);
+    assert!(
+        bola_group
+            .add_members_by_inbox_id(&[charlie.inbox_id()])
+            .await
+            .is_err(),
+    );
 }
 
 #[xmtp_common::test]
@@ -1415,10 +1424,12 @@ async fn test_max_limit_add() {
     amal_group.add_members(&clients).await.unwrap();
     let bola_wallet = generate_local_wallet();
     ClientBuilder::new_test_client(&bola_wallet).await;
-    assert!(amal_group
-        .add_members_by_inbox_id(&[bola_wallet.get_inbox_id(0)])
-        .await
-        .is_err(),);
+    assert!(
+        amal_group
+            .add_members_by_inbox_id(&[bola_wallet.get_inbox_id(0)])
+            .await
+            .is_err(),
+    );
 }
 
 #[xmtp_common::test]
@@ -1432,12 +1443,14 @@ async fn test_group_mutable_data() {
     amal_group.sync().await.unwrap();
 
     let group_mutable_metadata = amal_group.mutable_metadata().unwrap();
-    assert!(group_mutable_metadata.attributes.len().eq(&3));
-    assert!(group_mutable_metadata
-        .attributes
-        .get(&MetadataField::GroupName.to_string())
-        .unwrap()
-        .is_empty());
+    assert!(group_mutable_metadata.attributes.len().eq(&4));
+    assert!(
+        group_mutable_metadata
+            .attributes
+            .get(&MetadataField::GroupName.to_string())
+            .unwrap()
+            .is_empty()
+    );
 
     // Add bola to the group
     amal_group
@@ -1451,11 +1464,13 @@ async fn test_group_mutable_data() {
     let bola_group = bola_groups.first().unwrap();
     bola_group.sync().await.unwrap();
     let group_mutable_metadata = bola_group.mutable_metadata().unwrap();
-    assert!(group_mutable_metadata
-        .attributes
-        .get(&MetadataField::GroupName.to_string())
-        .unwrap()
-        .is_empty());
+    assert!(
+        group_mutable_metadata
+            .attributes
+            .get(&MetadataField::GroupName.to_string())
+            .unwrap()
+            .is_empty()
+    );
 
     // Update group name
     amal_group
@@ -1566,11 +1581,13 @@ async fn test_update_group_image_url_square() {
     amal_group.sync().await.unwrap();
 
     let group_mutable_metadata = amal_group.mutable_metadata().unwrap();
-    assert!(group_mutable_metadata
-        .attributes
-        .get(&MetadataField::GroupImageUrlSquare.to_string())
-        .unwrap()
-        .is_empty());
+    assert!(
+        group_mutable_metadata
+            .attributes
+            .get(&MetadataField::GroupImageUrlSquare.to_string())
+            .unwrap()
+            .is_empty()
+    );
 
     // Update group name
     amal_group
@@ -1656,11 +1673,13 @@ async fn test_group_mutable_data_group_permissions() {
     amal_group.sync().await.unwrap();
 
     let group_mutable_metadata = amal_group.mutable_metadata().unwrap();
-    assert!(group_mutable_metadata
-        .attributes
-        .get(&MetadataField::GroupName.to_string())
-        .unwrap()
-        .is_empty());
+    assert!(
+        group_mutable_metadata
+            .attributes
+            .get(&MetadataField::GroupName.to_string())
+            .unwrap()
+            .is_empty()
+    );
 
     // Add bola to the group
     amal_group
@@ -1673,11 +1692,13 @@ async fn test_group_mutable_data_group_permissions() {
     let bola_group = bola_groups.first().unwrap();
     bola_group.sync().await.unwrap();
     let group_mutable_metadata = bola_group.mutable_metadata().unwrap();
-    assert!(group_mutable_metadata
-        .attributes
-        .get(&MetadataField::GroupName.to_string())
-        .unwrap()
-        .is_empty());
+    assert!(
+        group_mutable_metadata
+            .attributes
+            .get(&MetadataField::GroupName.to_string())
+            .unwrap()
+            .is_empty()
+    );
 
     // Update group name
     amal_group
@@ -1768,10 +1789,12 @@ async fn test_group_admin_list_update() {
     amal_group.sync().await.unwrap();
     bola_group.sync().await.unwrap();
     assert_eq!(bola_group.admin_list().unwrap().len(), 1);
-    assert!(bola_group
-        .admin_list()
-        .unwrap()
-        .contains(&bola.inbox_id().to_string()));
+    assert!(
+        bola_group
+            .admin_list()
+            .unwrap()
+            .contains(&bola.inbox_id().to_string())
+    );
 
     // Verify that bola can now add caro because they are an admin
     bola_group
@@ -1799,10 +1822,12 @@ async fn test_group_admin_list_update() {
     amal_group.sync().await.unwrap();
     bola_group.sync().await.unwrap();
     assert_eq!(bola_group.admin_list().unwrap().len(), 0);
-    assert!(!bola_group
-        .admin_list()
-        .unwrap()
-        .contains(&bola.inbox_id().to_string()));
+    assert!(
+        !bola_group
+            .admin_list()
+            .unwrap()
+            .contains(&bola.inbox_id().to_string())
+    );
 
     // Verify that bola can not add charlie because they are not an admin
     bola.sync_welcomes().await.unwrap();
@@ -1865,10 +1890,12 @@ async fn test_group_super_admin_list_update() {
     amal_group.sync().await.unwrap();
     bola_group.sync().await.unwrap();
     assert_eq!(bola_group.super_admin_list().unwrap().len(), 2);
-    assert!(bola_group
-        .super_admin_list()
-        .unwrap()
-        .contains(&bola.inbox_id().to_string()));
+    assert!(
+        bola_group
+            .super_admin_list()
+            .unwrap()
+            .contains(&bola.inbox_id().to_string())
+    );
 
     // Verify that bola can now add caro as an admin
     bola_group
@@ -1877,10 +1904,12 @@ async fn test_group_super_admin_list_update() {
         .unwrap();
     bola_group.sync().await.unwrap();
     assert_eq!(bola_group.admin_list().unwrap().len(), 1);
-    assert!(bola_group
-        .admin_list()
-        .unwrap()
-        .contains(&caro.inbox_id().to_string()));
+    assert!(
+        bola_group
+            .admin_list()
+            .unwrap()
+            .contains(&caro.inbox_id().to_string())
+    );
 
     // Verify that no one can remove a super admin from a group
     amal_group
@@ -1898,10 +1927,12 @@ async fn test_group_super_admin_list_update() {
         .unwrap();
     bola_group.sync().await.unwrap();
     assert_eq!(bola_group.super_admin_list().unwrap().len(), 1);
-    assert!(!bola_group
-        .super_admin_list()
-        .unwrap()
-        .contains(&bola.inbox_id().to_string()));
+    assert!(
+        !bola_group
+            .super_admin_list()
+            .unwrap()
+            .contains(&bola.inbox_id().to_string())
+    );
 
     // Verify that amal can NOT remove themself as a super admin because they are the only remaining
     amal_group
@@ -2374,9 +2405,10 @@ async fn process_messages_abort_on_retryable_error() {
     let process_result = bo_group.process_messages(bo_messages).await;
     assert!(process_result.is_errored());
     assert_eq!(process_result.errored.len(), 1);
-    assert!(process_result.errored.iter().any(|(_, err)| err
-        .to_string()
-        .contains("cannot start a transaction within a transaction")));
+    assert!(process_result.errored.iter().any(|(_, err)| {
+        err.to_string()
+            .contains("cannot start a transaction within a transaction")
+    }));
 }
 
 #[xmtp_common::test]
@@ -2521,12 +2553,16 @@ async fn test_parallel_syncs() {
     let alix2_messages = alix2_group.find_messages(&MsgQueryArgs::default()).unwrap();
     assert_eq!(alix1_messages.len(), alix2_messages.len() - 1);
 
-    assert!(alix1_messages
-        .iter()
-        .any(|m| m.decrypted_message_bytes == "hi from alix2".as_bytes()));
-    assert!(alix2_messages
-        .iter()
-        .any(|m| m.decrypted_message_bytes == "hi from alix1".as_bytes()));
+    assert!(
+        alix1_messages
+            .iter()
+            .any(|m| m.decrypted_message_bytes == "hi from alix2".as_bytes())
+    );
+    assert!(
+        alix2_messages
+            .iter()
+            .any(|m| m.decrypted_message_bytes == "hi from alix1".as_bytes())
+    );
 }
 
 // Create a membership update intent, but don't sync it yet
@@ -2538,8 +2574,9 @@ async fn create_membership_update_no_sync(group: &TestMlsGroup) {
         return;
     }
 
-    group
-        .queue_intent(IntentKind::UpdateGroupMembership, intent_data.into(), false)
+    QueueIntent::update_group_membership()
+        .data(intent_data)
+        .queue(group)
         .unwrap();
 }
 
@@ -2619,12 +2656,16 @@ async fn add_missing_installs_reentrancy() {
     let alix2_messages = alix2_group.find_messages(&MsgQueryArgs::default()).unwrap();
     assert_eq!(alix1_messages.len(), alix2_messages.len() - 1);
 
-    assert!(alix1_messages
-        .iter()
-        .any(|m| m.decrypted_message_bytes == "hi from alix2".as_bytes()));
-    assert!(alix2_messages
-        .iter()
-        .any(|m| m.decrypted_message_bytes == "hi from alix1".as_bytes()));
+    assert!(
+        alix1_messages
+            .iter()
+            .any(|m| m.decrypted_message_bytes == "hi from alix2".as_bytes())
+    );
+    assert!(
+        alix2_messages
+            .iter()
+            .any(|m| m.decrypted_message_bytes == "hi from alix1".as_bytes())
+    );
 }
 
 #[xmtp_common::test(flavor = "multi_thread")]
@@ -2662,11 +2703,14 @@ async fn respect_allow_epoch_increment() {
     );
 }
 
+#[rstest]
 #[xmtp_common::test]
-async fn test_get_and_set_consent() {
-    let alix = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-    let bola = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-    let caro = ClientBuilder::new_test_client(&generate_local_wallet()).await;
+#[awt]
+async fn test_get_and_set_consent(
+    #[future] alix: ClientTester,
+    #[future] bola: ClientTester,
+    #[future] caro: ClientTester,
+) {
     let alix_group = alix.create_group(None, None).unwrap();
 
     // group consent state should be allowed if user created it
@@ -2720,8 +2764,8 @@ async fn test_get_and_set_consent() {
 async fn test_max_past_epochs() {
     // Create group with two members
     let bo_wallet = generate_local_wallet();
-    let alix = ClientBuilder::new_test_client(&generate_local_wallet()).await;
-    let bo = ClientBuilder::new_test_client(&bo_wallet).await;
+    let alix = ClientBuilder::new_test_client_vanilla(&generate_local_wallet()).await;
+    let bo = ClientBuilder::new_test_client_vanilla(&bo_wallet).await;
     let alix_group = alix
         .create_group_with_members(&[bo_wallet.identifier()], None, None)
         .await
@@ -2800,11 +2844,13 @@ async fn test_validate_dm_group() {
         None,
     )
     .unwrap();
-    assert!(valid_dm_group
-        .load_mls_group_with_lock(client.context.mls_storage(), |mls_group| {
-            validate_dm_group(&client.context, &mls_group, added_by_inbox).map_err(Into::into)
-        })
-        .is_ok());
+    assert!(
+        valid_dm_group
+            .load_mls_group_with_lock(client.context.mls_storage(), |mls_group| {
+                validate_dm_group(&client.context, &mls_group, added_by_inbox).map_err(Into::into)
+            })
+            .is_ok()
+    );
 
     // Test case 2: Invalid conversation type
     let invalid_protected_metadata =

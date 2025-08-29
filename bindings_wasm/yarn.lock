@@ -1891,27 +1891,27 @@ __metadata:
   languageName: node
   linkType: hard
 
-"playwright-core@npm:1.53.0":
-  version: 1.53.0
-  resolution: "playwright-core@npm:1.53.0"
+"playwright-core@npm:1.55.0":
+  version: 1.55.0
+  resolution: "playwright-core@npm:1.55.0"
   bin:
     playwright-core: cli.js
-  checksum: 10/881f27a9b7edd9954700489a5a4212cb91bcada226fd1d79a239b2eab0f333df1e2e41e275e6fa846d7f57c6a92afe14dca33ca7a2ce303dfb687d02511b7c69
+  checksum: 10/843376a8e2c1100d3f0625b2c85a69dc4418a0b268bdc7da6cf28252f6dc50c299c734f090a67c7f36cfa9140dacf5b95e817664e69642bcbaf06eea4d216c35
   languageName: node
   linkType: hard
 
 "playwright@npm:^1.52.0":
-  version: 1.53.0
-  resolution: "playwright@npm:1.53.0"
+  version: 1.55.0
+  resolution: "playwright@npm:1.55.0"
   dependencies:
     fsevents: "npm:2.3.2"
-    playwright-core: "npm:1.53.0"
+    playwright-core: "npm:1.55.0"
   dependenciesMeta:
     fsevents:
       optional: true
   bin:
     playwright: cli.js
-  checksum: 10/0b0258630f39b4d6ff1555d008ee4d591fe45cbe1e0f643a612397e3e6b1f7a99a2037a957eaa7351edd907ba10966ba105b2d244eafd1b247378910b660f086
+  checksum: 10/df02529693923b9b671822dac8a2ac8a8471c9142a05e14a24f8d0038a7dcf705712363991a070fc927466bbbe70e485145cf7a77882613822f56960afc4b892
   languageName: node
   linkType: hard
 
@@ -2587,10 +2587,10 @@ __metadata:
   linkType: hard
 
 "zx@npm:^8.4.0":
-  version: 8.5.0
-  resolution: "zx@npm:8.5.0"
+  version: 8.8.0
+  resolution: "zx@npm:8.8.0"
   bin:
     zx: build/cli.js
-  checksum: 10/820a2f0765e47356cd6f9bceb620cc3cb6675981b57301e778cf91d8c04e74ae06c5f39e219b552669f12906b54c490714fdcf7c4663f5c7df4f97015c471d9f
+  checksum: 10/98ed2c641604a48fad0b9ac8c835b0a75eb23bbf490072e8ca0f592a26fa1e7e28c2b2ba19b4d8ddfd023cf3d84a3205655841eec65f0e1f4bf8271083ee97f6
   languageName: node
   linkType: hard

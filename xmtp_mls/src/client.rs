@@ -1,22 +1,29 @@
-use crate::identity_updates::batch_get_association_state_with_verifier;
+use crate::{
+    identity_updates::batch_get_association_state_with_verifier,
+    messages::{
+        decoded_message::DecodedMessage,
+        enrichment::{EnrichMessageError, enrich_messages},
+    },
+};
+use xmtp_configuration::CREATE_PQ_KEY_PACKAGE_EXTENSION;
+
 use crate::{
     builder::SyncWorkerMode,
-    configuration::CREATE_PQ_KEY_PACKAGE_EXTENSION,
     context::XmtpSharedContext,
     groups::{
-        device_sync::{preference_sync::PreferenceUpdate, worker::SyncMetric, DeviceSyncClient},
+        ConversationListItem, GroupError, MlsGroup,
+        device_sync::{DeviceSyncClient, preference_sync::PreferenceUpdate, worker::SyncMetric},
         group_permissions::PolicySet,
         welcome_sync::WelcomeService,
-        ConversationListItem, GroupError, MlsGroup,
     },
-    identity::{parse_credential, Identity, IdentityError},
-    identity_updates::{load_identity_updates, IdentityUpdateError, IdentityUpdates},
+    identity::{Identity, IdentityError, parse_credential},
+    identity_updates::{IdentityUpdateError, IdentityUpdates, load_identity_updates},
     mls_store::{MlsStore, MlsStoreError},
     subscriptions::{LocalEventError, LocalEvents, SyncWorkerEvent},
     track,
     utils::VersionInfo,
     verified_key_package_v2::{KeyPackageVerificationError, VerifiedKeyPackageV2},
-    worker::{metrics::WorkerMetrics, WorkerRunner},
+    worker::{WorkerRunner, metrics::WorkerMetrics},
 };
 use openmls::prelude::tls_codec::Error as TlsCodecError;
 use std::{collections::HashMap, sync::Arc};
@@ -28,21 +35,21 @@ use xmtp_common::types::InstallationId;
 use xmtp_cryptography::signature::IdentifierValidationError;
 use xmtp_db::prelude::*;
 use xmtp_db::{
+    ConnectionExt, NotFound, StorageError, XmtpDb,
     consent_record::{ConsentState, ConsentType, StoredConsentRecord},
     db_connection::DbConnection,
     encrypted_store::conversation_list::ConversationListItem as DbConversationListItem,
     events::EventLevel,
     group::{ConversationType, GroupMembershipState, GroupQueryArgs},
     group_message::StoredGroupMessage,
-    ConnectionExt, NotFound, StorageError, XmtpDb,
 };
 use xmtp_id::{
+    AsIdRef, InboxId, InboxIdRef,
     associations::{
-        builder::{SignatureRequest, SignatureRequestError},
         AssociationError, AssociationState, Identifier, MemberIdentifier, SignatureError,
+        builder::{SignatureRequest, SignatureRequestError},
     },
     scw_verifier::SmartContractSignatureVerifier,
-    AsIdRef, InboxId, InboxIdRef,
 };
 use xmtp_mls_common::{
     group::{DMMetadataOptions, GroupMetadataOptions},
@@ -97,6 +104,8 @@ pub enum ClientError {
     Generic(String),
     #[error(transparent)]
     MlsStore(#[from] MlsStoreError),
+    #[error(transparent)]
+    EnrichMessage(#[from] EnrichMessageError),
 }
 
 impl ClientError {
@@ -204,9 +213,9 @@ where
 }
 
 /// Get the [`AssociationState`] for each `inbox_id`
-pub async fn inbox_addresses_with_verifier<C: ConnectionExt, ApiClient: XmtpApi>(
+pub async fn inbox_addresses_with_verifier<ApiClient: XmtpApi>(
     api_client: &ApiClientWrapper<ApiClient>,
-    conn: &impl DbQuery<C>,
+    conn: &impl DbQuery,
     inbox_ids: Vec<InboxIdRef<'_>>,
     scw_verifier: &impl SmartContractSignatureVerifier,
 ) -> Result<Vec<AssociationState>, ClientError> {
@@ -270,13 +279,16 @@ where
 
     pub fn device_sync_client(&self) -> DeviceSyncClient<Context> {
         let metrics = self.context.workers().sync_metrics();
-        DeviceSyncClient::new(self.context.clone(), metrics.unwrap_or_default())
+        DeviceSyncClient::new(
+            self.context.clone(),
+            metrics.unwrap_or(Arc::new(WorkerMetrics::new(self.context.installation_id()))),
+        )
     }
 
     /// Calls the server to look up the `inbox_id` associated with a given identifier
     pub async fn find_inbox_id_from_identifier(
         &self,
-        conn: &impl DbQuery<<Context::Db as XmtpDb>::Connection>,
+        conn: &impl DbQuery,
         identifier: Identifier,
     ) -> Result<Option<String>, ClientError> {
         let results = self
@@ -289,7 +301,7 @@ where
     /// If no `inbox_id` is found, returns None.
     pub(crate) async fn find_inbox_ids_from_identifiers(
         &self,
-        conn: &impl DbQuery<<Context::Db as XmtpDb>::Connection>,
+        conn: &impl DbQuery,
         identifiers: &[Identifier],
     ) -> Result<Vec<Option<String>>, ClientError> {
         let mut cached_inbox_ids = conn.fetch_cached_inbox_ids(identifiers)?;
@@ -435,6 +447,7 @@ where
         opts: Option<GroupMetadataOptions>,
     ) -> Result<MlsGroup<Context>, ClientError> {
         tracing::info!("creating group");
+
         let group: MlsGroup<Context> = MlsGroup::create_and_insert(
             self.context.clone(),
             GroupMembershipState::Allowed,
@@ -644,6 +657,26 @@ where
         Ok(message.ok_or(NotFound::MessageById(message_id))?)
     }
 
+    /// Look up and enrich a message by its ID, returning a [`DecodedMessage`]
+    /// Returns an error if the message is not found or if it cannot be decoded/enriched
+    pub fn message_v2(&self, message_id: Vec<u8>) -> Result<DecodedMessage, ClientError> {
+        let conn = self.context.db();
+        let message = conn
+            .get_group_message(&message_id)?
+            .ok_or_else(|| NotFound::MessageById(message_id.clone()))?;
+
+        let group_id = message.group_id.clone();
+
+        let enriched = enrich_messages(conn, &group_id, vec![message])?;
+
+        // Since enrich_messages returns a Vec<DecodedMessage>, we can use .into_iter().next().ok_or(...) to take ownership without cloning.
+        enriched
+            .into_iter()
+            .next()
+            // In practice `enrich_messages` should always return an array of the same length as the input
+            .ok_or_else(|| ClientError::Generic("Failed to decode message".to_string()))
+    }
+
     /// Query for groups with optional filters
     ///
     /// Filters:
@@ -702,6 +735,7 @@ where
                         conversation_item.created_at_ns,
                     ),
                     last_message: message,
+                    is_commit_log_forked: conversation_item.is_commit_log_forked,
                 }
             })
             .collect())
@@ -886,18 +920,18 @@ pub(crate) mod tests {
     use crate::utils::{LocalTesterBuilder, Tester};
     use crate::{builder::ClientBuilder, identity::serialize_key_package_hash_ref};
     use diesel::RunQueryDsl;
-    use futures::stream::StreamExt;
     use futures::TryStreamExt;
+    use futures::stream::StreamExt;
     use std::time::Duration;
-    use xmtp_common::time::now_ns;
     use xmtp_common::NS_IN_SEC;
+    use xmtp_common::time::now_ns;
     use xmtp_cryptography::utils::generate_local_wallet;
     use xmtp_db::consent_record::{ConsentType, StoredConsentRecord};
     use xmtp_db::identity::StoredIdentity;
     use xmtp_db::prelude::*;
     use xmtp_db::{
-        consent_record::ConsentState, group::GroupQueryArgs, group_message::MsgQueryArgs,
-        schema::identity_updates, ConnectionExt, Fetch,
+        ConnectionExt, Fetch, consent_record::ConsentState, group::GroupQueryArgs,
+        group_message::MsgQueryArgs, schema::identity_updates,
     };
     use xmtp_id::associations::test_utils::WalletTestExt;
 
@@ -1159,7 +1193,7 @@ pub(crate) mod tests {
     }
 
     #[rstest::rstest]
-    #[xmtp_common::test(flavor = "multi_thread")]
+    #[xmtp_common::test(flavor = "multi_thread", worker_threads = 10)]
     async fn test_sync_all_groups() {
         let alix = ClientBuilder::new_test_client(&generate_local_wallet()).await;
         let bo = ClientBuilder::new_test_client(&generate_local_wallet()).await;
@@ -1203,11 +1237,7 @@ pub(crate) mod tests {
         assert_eq!(bo_messages2.len(), 2);
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(
-        not(target_arch = "wasm32"),
-        tokio::test(flavor = "multi_thread", worker_threads = 2)
-    )]
+    #[xmtp_common::test(flavor = "multi_thread")]
     async fn test_sync_all_groups_and_welcomes() {
         tester!(alix);
         tester!(bo, passkey);
@@ -1685,9 +1715,9 @@ pub(crate) mod tests {
                 .unwrap()
         };
 
-        let proxy = alix.proxy.as_ref().unwrap();
+        let proxy = &alix.proxy(0);
 
-        let stream = alix.client.stream_conversations(None).await.unwrap();
+        let stream = alix.client.stream_conversations(None, false).await.unwrap();
         futures::pin_mut!(stream);
 
         start_new_convo().await;
@@ -1710,7 +1740,7 @@ pub(crate) mod tests {
         // stream closes after it gets the broken pipe b/c of blackhole & HTTP/2 KeepAlive
         futures_test::assert_stream_done!(stream);
         xmtp_common::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut new_stream = alix.client.stream_conversations(None).await.unwrap();
+        let mut new_stream = alix.client.stream_conversations(None, false).await.unwrap();
         let new_res = new_stream.try_next().await;
         assert!(new_res.is_ok());
         assert!(new_res.unwrap().is_some());

@@ -1,4 +1,5 @@
 use crate::{
+    GroupCommitLock, StorageError, XmtpApi,
     client::{Client, DeviceSync},
     context::XmtpMlsLocalContext,
     groups::{
@@ -9,11 +10,10 @@ use crate::{
     identity_updates::load_identity_updates,
     mutex_registry::MutexRegistry,
     track,
-    utils::{events::EventWorker, VersionInfo},
+    utils::{VersionInfo, events::EventWorker},
     worker::WorkerRunner,
-    GroupCommitLock, StorageError, XmtpApi,
 };
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{Arc, atomic::Ordering};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tracing::debug;
@@ -22,9 +22,9 @@ use xmtp_common::Retry;
 use xmtp_cryptography::signature::IdentifierValidationError;
 use xmtp_db::XmtpMlsStorageProvider;
 use xmtp_db::{
-    events::{Events, EVENTS_ENABLED},
-    sql_key_store::SqlKeyStore,
     XmtpDb,
+    events::{EVENTS_ENABLED, Events},
+    sql_key_store::SqlKeyStore,
 };
 use xmtp_id::scw_verifier::RemoteSignatureVerifier;
 use xmtp_id::scw_verifier::SmartContractSignatureVerifier;
@@ -74,7 +74,9 @@ pub struct ClientBuilder<ApiClient, S, Db = xmtp_db::DefaultStore> {
     version_info: VersionInfo,
     allow_offline: bool,
     disable_events: bool,
+    disable_commit_log_worker: bool,
     mls_storage: Option<S>,
+    sync_api_client: Option<ApiClientWrapper<ApiClient>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,7 +109,9 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             disable_events: false,
             #[cfg(test)]
             disable_events: true,
+            disable_commit_log_worker: false,
             mls_storage: None,
+            sync_api_client: None,
         }
     }
 }
@@ -122,7 +126,8 @@ where
     pub fn from_client(
         client: Client<ContextParts<ApiClient, S, Db>>,
     ) -> ClientBuilder<ApiClient, S, Db> {
-        let cloned_api = client.context.api_client.clone();
+        let cloned_api: ApiClientWrapper<ApiClient> = client.context.api_client.clone();
+        let cloned_sync_api: ApiClientWrapper<ApiClient> = client.context.sync_api_client.clone();
         ClientBuilder {
             api_client: Some(cloned_api),
             identity: Some(client.context.identity.clone()),
@@ -137,7 +142,9 @@ where
             disable_events: true,
             #[cfg(not(test))]
             disable_events: false,
+            disable_commit_log_worker: false,
             mls_storage: Some(client.context.mls_storage.clone()),
+            sync_api_client: Some(cloned_sync_api),
         }
     }
 }
@@ -161,8 +168,9 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             version_info,
             allow_offline,
             disable_events,
+            disable_commit_log_worker,
             mut mls_storage,
-            ..
+            mut sync_api_client,
         } = self;
 
         let api_client = api_client
@@ -170,6 +178,13 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             .ok_or(ClientBuilderError::MissingParameter {
                 parameter: "api_client",
             })?;
+
+        let sync_api_client =
+            sync_api_client
+                .take()
+                .ok_or(ClientBuilderError::MissingParameter {
+                    parameter: "sync_api_client",
+                })?;
 
         let scw_verifier = scw_verifier
             .take()
@@ -230,6 +245,7 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
                 mode: device_sync_worker_mode,
             },
             workers: workers.clone(),
+            sync_api_client,
         });
 
         // register workers
@@ -251,6 +267,13 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             .register_new_worker::<DisappearingMessagesWorker<ContextParts<ApiClient, S, Db>>, _>(
                 context.clone(),
             );
+        // Enable CommitLogWorker based on configuration
+        if xmtp_configuration::ENABLE_COMMIT_LOG && !disable_commit_log_worker {
+            workers.register_new_worker::<
+                crate::groups::commit_log::CommitLogWorker<ContextParts<ApiClient, S, Db>>,
+                _,
+            >(context.clone());
+        }
         workers.spawn();
         let client = Client {
             context,
@@ -286,7 +309,9 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             version_info: self.version_info,
             allow_offline: self.allow_offline,
             disable_events: self.disable_events,
+            disable_commit_log_worker: self.disable_commit_log_worker,
             mls_storage: self.mls_storage,
+            sync_api_client: self.sync_api_client,
         }
     }
 
@@ -310,6 +335,7 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             version_info: self.version_info,
             allow_offline: self.allow_offline,
             disable_events: self.disable_events,
+            disable_commit_log_worker: self.disable_commit_log_worker,
             mls_storage: Some(SqlKeyStore::new(
                 self.store
                     .as_ref()
@@ -319,6 +345,7 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
                     .db(),
             )),
             store: self.store,
+            sync_api_client: self.sync_api_client,
         })
     }
 
@@ -334,7 +361,9 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             version_info: self.version_info,
             allow_offline: self.allow_offline,
             disable_events: self.disable_events,
+            disable_commit_log_worker: self.disable_commit_log_worker,
             mls_storage: Some(mls_storage),
+            sync_api_client: self.sync_api_client,
         }
     }
 
@@ -366,9 +395,10 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
         }
     }
 
-    pub fn api_client<A>(self, api_client: A) -> ClientBuilder<A, S, Db> {
+    pub fn api_clients<A>(self, api_client: A, sync_api_client: A) -> ClientBuilder<A, S, Db> {
         let api_retry = Retry::builder().build();
-        let api_client = ApiClientWrapper::new(api_client, api_retry);
+        let api_client = ApiClientWrapper::new(api_client, api_retry.clone());
+        let sync_api_client = ApiClientWrapper::new(sync_api_client, api_retry.clone());
         ClientBuilder {
             api_client: Some(api_client),
             identity: self.identity,
@@ -380,7 +410,9 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             version_info: self.version_info,
             allow_offline: self.allow_offline,
             disable_events: self.disable_events,
+            disable_commit_log_worker: self.disable_commit_log_worker,
             mls_storage: self.mls_storage,
+            sync_api_client: Some(sync_api_client),
         }
     }
 
@@ -445,6 +477,16 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
         }
     }
 
+    /// Control whether the CommitLogWorker background task is enabled.
+    /// Useful for tests that need deterministic commit log operations.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_commit_log_worker(self, enabled: bool) -> Self {
+        Self {
+            disable_commit_log_worker: !enabled,
+            ..self
+        }
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     pub fn enable_sqlite_triggers(self) -> Self
     where
@@ -484,7 +526,13 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             version_info: self.version_info,
             allow_offline: self.allow_offline,
             disable_events: self.disable_events,
+            disable_commit_log_worker: self.disable_commit_log_worker,
             mls_storage: self.mls_storage,
+            sync_api_client: Some(
+                self.sync_api_client
+                    .expect("checked for none")
+                    .attach_debug_wrapper(),
+            ),
         })
     }
 
@@ -504,7 +552,9 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             version_info: self.version_info,
             allow_offline: self.allow_offline,
             disable_events: self.disable_events,
+            disable_commit_log_worker: self.disable_commit_log_worker,
             mls_storage: self.mls_storage,
+            sync_api_client: self.sync_api_client,
         }
     }
 
@@ -535,7 +585,9 @@ impl<ApiClient, S, Db> ClientBuilder<ApiClient, S, Db> {
             version_info: self.version_info,
             allow_offline: self.allow_offline,
             disable_events: self.disable_events,
+            disable_commit_log_worker: self.disable_commit_log_worker,
             mls_storage: self.mls_storage,
+            sync_api_client: self.sync_api_client,
         })
     }
 }

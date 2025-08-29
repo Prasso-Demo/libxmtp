@@ -1,14 +1,14 @@
-use std::collections::HashSet;
-
-use super::{stream_conversations::ConversationStreamError, Result};
+use super::{Result, stream_conversations::ConversationStreamError};
 use crate::context::XmtpSharedContext;
-use crate::groups::welcome_sync::WelcomeService;
 use crate::groups::GroupError;
+use crate::groups::InitialMembershipValidator;
+use crate::groups::welcome_sync::WelcomeService;
 use crate::intents::ProcessIntentError;
 use crate::{groups::MlsGroup, subscriptions::WelcomeOrGroup};
-use xmtp_common::{retry_async, Retry};
-use xmtp_db::{group::ConversationType, prelude::*, NotFound};
-use xmtp_proto::mls_v1::{welcome_message, WelcomeMessage};
+use std::collections::HashSet;
+use xmtp_common::{Retry, retry_async};
+use xmtp_db::{NotFound, group::ConversationType, prelude::*};
+use xmtp_proto::mls_v1::{WelcomeMessage, welcome_message};
 
 /// Future for processing `WelcomeorGroup`
 pub struct ProcessWelcomeFuture<Context> {
@@ -20,6 +20,8 @@ pub struct ProcessWelcomeFuture<Context> {
     item: WelcomeOrGroup,
     /// Conversation type to filter for, if any.
     conversation_type: Option<ConversationType>,
+    /// To skip or include duplicate dms in the stream
+    include_duplicate_dms: bool,
 }
 
 pub enum ProcessWelcomeResult<Context> {
@@ -51,6 +53,7 @@ where
     /// * `client` - The client to use for processing and database operations
     /// * `item` - The welcome message or group to process
     /// * `conversation_type` - Optional filter for specific conversation types
+    /// * `include_duplicate_dms` - Optional filter to include duplicate dms in the stream
     ///
     /// # Returns
     /// * `Result<ProcessWelcomeFuture<C>>` - A new future for processing
@@ -59,26 +62,19 @@ where
     /// Returns an error if initialization fails
     ///
     /// # Example
-    /// ```no_run
-    /// let future = ProcessWelcomeFuture::new(
-    ///     known_ids,
-    ///     client.clone(),
-    ///     WelcomeOrGroup::Welcome(welcome),
-    ///     Some(ConversationType::Group),
-    /// )?;
-    /// let result = future.process().await?;
-    /// ```
     pub fn new(
         known_welcome_ids: HashSet<i64>,
         context: Context,
         item: WelcomeOrGroup,
         conversation_type: Option<ConversationType>,
+        include_duplicate_dms: bool,
     ) -> Result<ProcessWelcomeFuture<Context>> {
         Ok(Self {
             known_welcome_ids,
             context,
             item,
             conversation_type,
+            include_duplicate_dms,
         })
     }
 }
@@ -195,7 +191,8 @@ where
                 }
 
                 // If it's a duplicate DM, don’t stream
-                if metadata.conversation_type == ConversationType::Dm
+                if !self.include_duplicate_dms
+                    && metadata.conversation_type == ConversationType::Dm
                     && self.context.db().has_duplicate_dm(&group.group_id)?
                 {
                     tracing::debug!("Duplicate DM group detected from Group(id). Skipping stream.");
@@ -214,7 +211,8 @@ where
             NewStored { group, maybe_id } => {
                 let metadata = group.metadata().await?;
                 // If it's a duplicate DM, don’t stream
-                if metadata.conversation_type == ConversationType::Dm
+                if !self.include_duplicate_dms
+                    && metadata.conversation_type == ConversationType::Dm
                     && self.context.db().has_duplicate_dm(&group.group_id)?
                 {
                     tracing::debug!("Duplicate DM group detected from Group(id). Skipping stream.");
@@ -267,7 +265,7 @@ where
         let welcome_message::V1 {
             id,
             created_ns: _,
-            ref installation_key,
+            installation_key,
             ..
         } = welcome;
         let id = *id as i64;
@@ -287,7 +285,12 @@ where
         let welcomes = WelcomeService::new(self.context.clone());
         let res = retry_async!(
             Retry::default(),
-            (async { welcomes.process_new_welcome(welcome, false).await })
+            (async {
+                let validator = InitialMembershipValidator::new(&self.context);
+                welcomes
+                    .process_new_welcome(welcome, false, validator)
+                    .await
+            })
         );
 
         if let Ok(_)

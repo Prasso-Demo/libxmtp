@@ -3,13 +3,11 @@ use super::*;
 #[cfg(target_arch = "wasm32")]
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
+use crate::utils::ClientTester;
 use crate::{assert_msg, builder::ClientBuilder};
 use crate::{
     tester,
-    utils::{
-        fixtures::{bo, eve},
-        FullXmtpClient,
-    },
+    utils::fixtures::{bo, eve},
 };
 use futures::StreamExt;
 use rstest::*;
@@ -266,7 +264,11 @@ async fn test_stream_all_messages_does_not_lose_messages() {
         .collect::<Vec<String>>();
     let duplicates = find_duplicates_with_count(msgs);
     assert!(duplicates.is_empty());
-    assert_eq!(messages.len(), 45, "too many messages mean duplicates, too little means missed. Also ensure timeout is sufficient.");
+    assert_eq!(
+        messages.len(),
+        45,
+        "too many messages mean duplicates, too little means missed. Also ensure timeout is sufficient."
+    );
 }
 
 #[rstest::rstest]
@@ -391,8 +393,8 @@ async fn test_stream_all_messages_filters_by_consent_state(
 #[xmtp_common::test]
 #[awt]
 async fn stream_messages_keeps_track_of_cursor(
-    #[future] bo: FullXmtpClient,
-    #[future] eve: FullXmtpClient,
+    #[future] bo: ClientTester,
+    #[future] eve: ClientTester,
 ) {
     tester!(alice);
     let group = alice.create_group(None, None).unwrap();

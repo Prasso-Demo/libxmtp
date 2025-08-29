@@ -5,7 +5,7 @@ use crate::app::{
     types::*,
 };
 use crate::{app, args};
-use color_eyre::eyre::{self, Result};
+use color_eyre::eyre::{self, ContextCompat, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::Arc;
 
@@ -55,7 +55,12 @@ impl GenerateGroups {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
         for _ in 0..n {
-            let identity = self.identity_store.random(network, &mut rng)?.unwrap();
+            let identity = self
+                .identity_store
+                .random(network, &mut rng)?
+                .with_context(
+                    || "no local identities found in database, have identities been generated?",
+                )?;
             let invitees = self.identity_store.random_n(network, &mut rng, invitees)?;
             let bar_pointer = bar.clone();
             let network = network.clone();
@@ -92,15 +97,15 @@ impl GenerateGroups {
 
             // going above 128 we hit "unable to open database errors"
             // This may be related to open file limits
-            if set.len() >= 64 {
-                if let Some(group) = set.join_next().await {
-                    match group {
-                        Ok(group) => {
-                            groups.push(group?);
-                        }
-                        Err(e) => {
-                            error!("{}", e.to_string());
-                        }
+            if set.len() >= 64
+                && let Some(group) = set.join_next().await
+            {
+                match group {
+                    Ok(group) => {
+                        groups.push(group?);
+                    }
+                    Err(e) => {
+                        error!("{}", e.to_string());
                     }
                 }
             }

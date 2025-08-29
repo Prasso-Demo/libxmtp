@@ -1,21 +1,21 @@
 use crate::{
     client::ClientError,
-    configuration::DeviceSyncUrls,
     context::XmtpSharedContext,
     groups::device_sync::DeviceSyncError,
     worker::{BoxedWorker, NeedsDbReconnect, Worker, WorkerFactory, WorkerKind, WorkerResult},
 };
 use std::{
     fmt::Debug,
-    sync::{atomic::Ordering, LazyLock},
+    sync::{LazyLock, atomic::Ordering},
 };
 use thiserror::Error;
 use tokio::sync::broadcast;
 use xmtp_archive::exporter::ArchiveExporter;
 use xmtp_common::time::now_ns;
+use xmtp_configuration::DeviceSyncUrls;
 use xmtp_db::{
-    events::{EventLevel, Events, EVENTS_ENABLED},
-    ConnectionExt, DbQuery, StorageError, Store,
+    DbQuery, StorageError, Store,
+    events::{EVENTS_ENABLED, EventLevel, Events},
 };
 use xmtp_proto::xmtp::device_sync::{BackupElementSelection, BackupOptions};
 
@@ -99,7 +99,8 @@ where
 ///
 /// The macro requires an event name and details object as the first two arguments:
 ///
-/// ```rust
+/// ```rust,ignore
+/// use xmtp_mls::track;
 /// track!("user_login", {
 ///     "timestamp": "2024-01-01T12:00:00Z",
 ///     "method": "oauth"
@@ -107,7 +108,8 @@ where
 /// ```
 ///
 /// Track a message event with details:
-/// ```rust
+/// ```rust,ignore
+/// use xmtp_mls::track;
 /// track!("message_sent", {
 ///     "recipient": "alice@example.com",
 ///     "message_type": "text",
@@ -131,7 +133,8 @@ where
 /// # Examples
 ///
 /// Track an event with group association:
-/// ```rust
+/// ```rust,ignore
+/// use xmtp_mls::track;
 /// track!("group_created", {
 ///     "name": "Team Chat",
 ///     "member_count": 5
@@ -139,7 +142,8 @@ where
 /// ```
 ///
 /// Track an event with custom level:
-/// ```rust
+/// ```rust,ignore
+/// use xmtp_mls::track;
 /// track!("error_occurred", {
 ///     "error_type": "network_timeout",
 ///     "retry_count": 3
@@ -147,7 +151,9 @@ where
 /// ```
 ///
 /// Track an event with both group and level:
-/// ```rust
+/// ```rust,ignore
+/// use xmtp_mls::track;
+/// use xmtp_db::events::EventLevel;
 /// track!("message_delivery_failed", {
 ///     "reason": "recipient_offline",
 ///     "will_retry": true
@@ -253,7 +259,7 @@ macro_rules! track {
 ///
 /// # Usage
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Track with default "Error" label
 /// let result = track_err!(some_operation());
 ///
@@ -352,13 +358,10 @@ where
     }
 }
 
-pub async fn upload_debug_archive<C>(
-    db: impl DbQuery<C> + Send + Sync + 'static,
+pub async fn upload_debug_archive(
+    db: impl DbQuery + Send + Sync + 'static,
     device_sync_server_url: Option<impl AsRef<str>>,
-) -> Result<String, DeviceSyncError>
-where
-    C: ConnectionExt + Send + Sync + 'static,
-{
+) -> Result<String, DeviceSyncError> {
     let device_sync_server_url = device_sync_server_url
         .map(|url| url.as_ref().to_string())
         .unwrap_or(DeviceSyncUrls::PRODUCTION_ADDRESS.to_string());
@@ -385,8 +388,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{configuration::DeviceSyncUrls, tester, utils::events::upload_debug_archive};
+    use crate::{tester, utils::events::upload_debug_archive};
     use std::time::Duration;
+    use xmtp_configuration::DeviceSyncUrls;
 
     #[rstest::rstest]
     #[xmtp_common::test(unwrap_try = true)]

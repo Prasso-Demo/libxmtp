@@ -1,11 +1,11 @@
+use crate::GroupCommitLock;
 use crate::builder::SyncWorkerMode;
 use crate::client::DeviceSync;
 use crate::groups::device_sync::worker::SyncMetric;
 use crate::subscriptions::{LocalEvents, SyncWorkerEvent};
 use crate::utils::VersionInfo;
-use crate::worker::metrics::WorkerMetrics;
 use crate::worker::WorkerRunner;
-use crate::GroupCommitLock;
+use crate::worker::metrics::WorkerMetrics;
 use crate::{
     identity::{Identity, IdentityError},
     mutex_registry::MutexRegistry,
@@ -14,11 +14,11 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use xmtp_api::{ApiClientWrapper, XmtpApi};
 use xmtp_common::types::InstallationId;
-use xmtp_db::xmtp_openmls_provider::XmtpOpenMlsProviderRef;
 use xmtp_db::XmtpDb;
 use xmtp_db::XmtpMlsStorageProvider;
+use xmtp_db::xmtp_openmls_provider::XmtpOpenMlsProviderRef;
 use xmtp_id::scw_verifier::SmartContractSignatureVerifier;
-use xmtp_id::{associations::builder::SignatureRequest, InboxIdRef};
+use xmtp_id::{InboxIdRef, associations::builder::SignatureRequest};
 
 #[cfg(any(test, feature = "test-utils"))]
 use crate::groups::device_sync::DeviceSyncClient;
@@ -31,6 +31,7 @@ pub struct XmtpMlsLocalContext<ApiClient, Db, S> {
     pub(crate) identity: Identity,
     /// The XMTP Api Client
     pub(crate) api_client: ApiClientWrapper<ApiClient>,
+    pub(crate) sync_api_client: ApiClientWrapper<ApiClient>, // sync-only channel
     /// XMTP Local Storage
     pub(crate) store: Db,
     pub(crate) mls_storage: S,
@@ -57,7 +58,7 @@ where
     }
 
     /// Creates a new MLS Provider
-    pub fn mls_provider(&self) -> XmtpOpenMlsProviderRef<S> {
+    pub fn mls_provider(&'_ self) -> XmtpOpenMlsProviderRef<'_, S> {
         XmtpOpenMlsProviderRef::new(&self.mls_storage)
     }
 
@@ -84,7 +85,30 @@ where
         self: &Arc<XmtpMlsLocalContext<ApiClient, Db, S>>,
     ) -> DeviceSyncClient<Arc<Self>> {
         let metrics = self.sync_metrics();
-        DeviceSyncClient::new(Arc::clone(self), metrics.unwrap_or_default())
+        DeviceSyncClient::new(
+            Arc::clone(self),
+            metrics.unwrap_or(Arc::new(WorkerMetrics::new(self.installation_id()))),
+        )
+    }
+}
+
+impl<ApiClient, Db, S> XmtpMlsLocalContext<ApiClient, Db, S> {
+    pub fn replace_mls_store<S2>(self, mls_store: S2) -> XmtpMlsLocalContext<ApiClient, Db, S2> {
+        XmtpMlsLocalContext::<ApiClient, Db, S2> {
+            identity: self.identity,
+            api_client: self.api_client,
+            sync_api_client: self.sync_api_client,
+            store: self.store,
+            mls_storage: mls_store,
+            mutexes: self.mutexes,
+            mls_commit_lock: self.mls_commit_lock,
+            version_info: self.version_info,
+            local_events: self.local_events,
+            worker_events: self.worker_events,
+            scw_verifier: self.scw_verifier,
+            device_sync: self.device_sync,
+            workers: self.workers,
+        }
     }
 }
 
@@ -138,6 +162,7 @@ where
     fn context_ref(&self) -> &Self::ContextReference;
     fn db(&self) -> <Self::Db as XmtpDb>::DbQuery;
     fn api(&self) -> &ApiClientWrapper<Self::ApiClient>;
+    fn sync_api(&self) -> &ApiClientWrapper<Self::ApiClient>;
     fn scw_verifier(&self) -> Arc<Box<dyn SmartContractSignatureVerifier>>;
 
     fn device_sync(&self) -> &DeviceSync;
@@ -150,7 +175,7 @@ where
         !matches!(self.device_sync().mode, SyncWorkerMode::Disabled)
     }
     /// Creates a new MLS Provider
-    fn mls_provider(&self) -> XmtpOpenMlsProviderRef<Self::MlsStorage> {
+    fn mls_provider(&'_ self) -> XmtpOpenMlsProviderRef<'_, Self::MlsStorage> {
         XmtpOpenMlsProviderRef::new(self.mls_storage())
     }
 
@@ -198,6 +223,10 @@ where
 
     fn api(&self) -> &ApiClientWrapper<Self::ApiClient> {
         &self.api_client
+    }
+
+    fn sync_api(&self) -> &ApiClientWrapper<Self::ApiClient> {
+        &self.sync_api_client
     }
 
     fn scw_verifier(&self) -> Arc<Box<dyn SmartContractSignatureVerifier>> {
@@ -262,6 +291,10 @@ where
 
     fn api(&self) -> &ApiClientWrapper<Self::ApiClient> {
         <T as XmtpSharedContext>::api(self)
+    }
+
+    fn sync_api(&self) -> &ApiClientWrapper<Self::ApiClient> {
+        <T as XmtpSharedContext>::sync_api(self)
     }
 
     fn scw_verifier(&self) -> Arc<Box<dyn SmartContractSignatureVerifier>> {

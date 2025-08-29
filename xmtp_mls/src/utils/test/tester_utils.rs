@@ -1,16 +1,17 @@
 #![allow(unused)]
 
 use super::FullXmtpClient;
+use xmtp_configuration::{DeviceSyncUrls, DockerUrls};
+
 use crate::{
+    Client,
     builder::{ClientBuilder, SyncWorkerMode},
     client::ClientError,
-    configuration::DeviceSyncUrls,
     context::XmtpSharedContext,
     groups::device_sync::worker::SyncMetric,
     subscriptions::SubscribeError,
-    utils::{register_client, TestClient, TestMlsStorage, VersionInfo},
+    utils::{TestClient, TestMlsStorage, VersionInfo, register_client},
     worker::metrics::WorkerMetrics,
-    Client,
 };
 use alloy::signers::local::PrivateKeySigner;
 use futures::Stream;
@@ -19,42 +20,41 @@ use parking_lot::Mutex;
 use passkey::{
     authenticator::{Authenticator, UserCheck, UserValidationMethod},
     client::{Client as PasskeyClient, DefaultClientData},
-    types::{ctap2::*, rand::random_vec, webauthn::*, Bytes, Passkey},
+    types::{Bytes, Passkey, ctap2::*, rand::random_vec, webauthn::*},
 };
 use public_suffix::PublicSuffixList;
 use std::{
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 use tokio::{runtime::Handle, sync::OnceCell};
 use toxiproxy_rust::proxy::{Proxy, ProxyPack};
 use url::Url;
 use xmtp_api::XmtpApi;
-use xmtp_api_http::{constants::ApiUrls, LOCALHOST_ADDRESS};
 use xmtp_common::StreamHandle;
 use xmtp_common::TestLogReplace;
+use xmtp_configuration::LOCALHOST;
 use xmtp_cryptography::{signature::SignatureError, utils::generate_local_wallet};
 use xmtp_db::{
-    group_message::StoredGroupMessage, sql_key_store::SqlKeyStore, MlsProviderExt,
-    XmtpOpenMlsProvider,
+    MlsProviderExt, XmtpOpenMlsProvider, group_message::StoredGroupMessage,
+    sql_key_store::SqlKeyStore,
 };
 use xmtp_id::{
+    InboxOwner,
     associations::{
-        ident,
+        Identifier, ident,
         test_utils::MockSmartContractSignatureVerifier,
         unverified::{UnverifiedPasskeySignature, UnverifiedSignature},
-        Identifier,
     },
     scw_verifier::SmartContractSignatureVerifier,
-    InboxOwner,
 };
+use xmtp_proto::api_client::ApiBuilder;
 use xmtp_proto::prelude::XmtpTestClient;
+use xmtp_proto::{TestApiBuilder, ToxicProxies};
 
-pub static TOXIPROXY: OnceCell<toxiproxy_rust::client::Client> = OnceCell::const_new();
-pub static TOXI_PORT: AtomicUsize = AtomicUsize::new(21100);
 type XmtpMlsProvider = XmtpOpenMlsProvider<Arc<TestMlsStorage>>;
 
 /// A test client wrapper that auto-exposes all of the usual component access boilerplate.
@@ -67,7 +67,7 @@ where
     pub client: Client,
     pub worker: Option<Arc<WorkerMetrics<SyncMetric>>>,
     pub stream_handle: Option<Box<dyn StreamHandle<StreamOutput = Result<(), SubscribeError>>>>,
-    pub proxy: Option<Proxy>,
+    pub proxy: Option<ToxicProxies>,
     /// Replacement names for this tester
     /// Replacements are removed on drop
     pub replace: TestLogReplace,
@@ -131,48 +131,35 @@ where
 {
     async fn build(&self) -> Tester<Owner, FullXmtpClient> {
         let mut replace = TestLogReplace::default();
-        if let Some(name) = &self.name {
+        if let Some(name) = &self.name
+            && !self.installation
+        {
             let ident = self.owner.get_identifier().unwrap();
             replace.add(&ident.to_string(), &format!("{name}_ident"));
         }
-        let mut api_addr = format!("localhost:{}", ClientBuilder::local_port());
+        let mut local_client = TestClient::create_local();
+        let mut sync_api_client = TestClient::create_local();
         let mut proxy = None;
 
         if self.proxy {
-            let toxiproxy = TOXIPROXY
-                .get_or_init(|| async {
-                    let toxiproxy = toxiproxy_rust::client::Client::new("0.0.0.0:8474");
-                    toxiproxy.reset().await.unwrap();
-                    toxiproxy
-                })
-                .await;
-
-            let port = TOXI_PORT.fetch_add(1, Ordering::SeqCst);
-
-            let result = toxiproxy
-                .populate(vec![
-                    ProxyPack::new(
-                        format!("Proxy {port}"),
-                        format!("[::]:{port}"),
-                        format!("node:{}", ClientBuilder::local_port()),
-                    )
-                    .await,
-                ])
-                .await
-                .unwrap();
-
-            proxy = Some(result.into_iter().nth(0).unwrap());
-            api_addr = format!("localhost:{port}");
+            proxy = Some(local_client.with_toxiproxy().await);
+            sync_api_client.with_existing_toxi(local_client.host().unwrap());
         }
-
-        let api_client = ClientBuilder::new_custom_api_client(&format!("http://{api_addr}")).await;
+        tracing::info!(
+            "building with hosts = {:?}:{:?}",
+            local_client.host(),
+            sync_api_client.host()
+        );
+        let api_client = local_client.build().await.unwrap();
+        let sync_api_client = sync_api_client.build().await.unwrap();
         let client = ClientBuilder::new_test_builder(&self.owner)
             .await
-            .api_client(api_client)
+            .api_clients(api_client, sync_api_client)
             .with_device_sync_worker_mode(Some(self.sync_mode))
             .with_device_sync_server_url(self.sync_url.clone())
             .maybe_version(self.version.clone())
             .with_disable_events(Some(!self.events))
+            .with_commit_log_worker(self.commit_log_worker)
             .build()
             .await
             .unwrap();
@@ -185,10 +172,10 @@ where
             replace.add(client.inbox_id(), name);
         }
         let worker = client.context.sync_metrics();
-        if let Some(worker) = &worker {
-            if self.wait_for_init {
-                worker.wait_for_init().await.unwrap();
-            }
+        if let Some(worker) = &worker
+            && self.wait_for_init
+        {
+            worker.wait_for_init().await.unwrap();
         }
         client.sync_welcomes().await;
 
@@ -242,12 +229,31 @@ where
     pub fn builder_from(owner: Owner) -> TesterBuilder<Owner> {
         TesterBuilder::new().owner(owner)
     }
+
+    /// Create a new installations for this client
+    pub async fn installation(&self) -> Tester<Owner, FullXmtpClient> {
+        TesterBuilder::new()
+            .owner(self.builder.owner.clone())
+            .build()
+            .await
+    }
     pub fn worker(&self) -> &Arc<WorkerMetrics<SyncMetric>> {
         self.worker.as_ref().unwrap()
     }
 
-    pub fn proxy(&self) -> &Proxy {
+    pub fn proxies(&self) -> &ToxicProxies {
         self.proxy.as_ref().unwrap()
+    }
+
+    pub fn proxy(&self, n: usize) -> &Proxy {
+        self.proxy.as_ref().unwrap().proxy(n)
+    }
+
+    pub async fn for_each_proxy<F>(&self, f: F)
+    where
+        F: AsyncFn(&Proxy),
+    {
+        self.proxy.as_ref().unwrap().for_each(f).await
     }
 }
 
@@ -276,6 +282,9 @@ where
     pub events: bool,
     pub version: Option<VersionInfo>,
     pub proxy: bool,
+    pub commit_log_worker: bool,
+    /// whether this builder represents a second installation
+    installation: bool,
 }
 
 impl TesterBuilder<PrivateKeySigner> {
@@ -296,6 +305,8 @@ impl Default for TesterBuilder<PrivateKeySigner> {
             events: false,
             version: None,
             proxy: false,
+            commit_log_worker: true, // Default to enabled to match production
+            installation: false,
         }
     }
 }
@@ -318,6 +329,8 @@ where
             events: self.events,
             version: self.version,
             proxy: self.proxy,
+            commit_log_worker: self.commit_log_worker,
+            installation: self.installation,
         }
     }
 
@@ -370,9 +383,23 @@ where
         }
     }
 
+    pub fn with_commit_log_worker(self, enabled: bool) -> Self {
+        Self {
+            commit_log_worker: enabled,
+            ..self
+        }
+    }
+
     pub fn events(self) -> Self {
         Self {
             events: true,
+            ..self
+        }
+    }
+
+    pub fn installation(self) -> Self {
+        Self {
+            installation: true,
             ..self
         }
     }
